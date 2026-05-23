@@ -8,9 +8,14 @@ node_modules/
 .local-tools/
 dist/
 coverage/
+policies/generated/
+.DS_Store
+**/.DS_Store
+.sisyphus/
 *.gb
 *.gbc
 *.gba
 *.sav
 *.state
 *.png
+*.ss1
