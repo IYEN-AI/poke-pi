@@ -281,7 +281,7 @@ async function routeControlRequest(input: {
   }
 
   if (url.pathname === "/api/control/llm") {
-    const result = control.start({ kind: "llm", maxSteps: positiveNumberField(body, "maxSteps"), runId: stringField(body, "runId"), mode: modeField(body) });
+    const result = control.start({ kind: "llm", maxSteps: positiveNumberField(body, "maxSteps"), runId: stringField(body, "runId"), mode: modeField(body), policyFile: stringField(body, "policyFile") });
     sendJson(response, objectField(result, "error") === undefined ? 202 : 409, result);
     return;
   }

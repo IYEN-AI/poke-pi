@@ -222,7 +222,7 @@ describe("CLI", () => {
     const io = createIo();
     const requests: Array<{ path: string; body: unknown }> = [];
 
-    const exitCode = await withEnv({ OPENAI_API_KEY: "unit-test-key" }, () => runCli(["llm", "--max-steps", "2", "--run-id", "llm-easy"], io, {
+    const exitCode = await withEnv({ OPENAI_API_KEY: "unit-test-key" }, () => runCli(["llm", "--max-steps", "2", "--run-id", "llm-easy", "--policy-file", "policies/generated/pallet-v1.json"], io, {
       async controlRequest(_baseUrl, path, body) {
         requests.push({ path, body });
         if (path === "/api/control/status") {
@@ -235,7 +235,7 @@ describe("CLI", () => {
     expect(exitCode).toBe(0);
     expect(requests).toEqual([
       { path: "/api/control/status", body: undefined },
-      { path: "/api/control/llm", body: { maxSteps: 2, runId: "llm-easy", mode: "stage1" } }
+      { path: "/api/control/llm", body: { maxSteps: 2, runId: "llm-easy", mode: "stage1", policyFile: "policies/generated/pallet-v1.json" } }
     ]);
   });
 

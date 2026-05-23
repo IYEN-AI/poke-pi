@@ -97,7 +97,7 @@ export function getHarnessHelp(): string {
     "  npm run poke -- scout [--max-steps N] [--run-id ID] [--port N]",
     "  npm run poke -- synthesize-policy --from-run RUN --policy-id ID [--objective TEXT]",
     "  npm run poke -- play-policy --policy-file policies/generated/ID.json [--max-steps N] [--run-id ID]",
-    "  npm run poke -- llm [--max-steps N] [--run-id ID] [--port N]",
+    "  npm run poke -- llm [--max-steps N] [--run-id ID] [--port N] [--policy-file policies/generated/ID.json]",
     "  npm run poke -- ui [--port N]",
     "  npm run poke -- stop",
     "  npm run poke -- clean-failed --yes",
@@ -116,7 +116,7 @@ export function getHarnessHelp(): string {
     "  play-policy  Execute a generated JSON heuristic policy artifact.",
     "  status     Print redacted config and mGBA preflight status.",
     "  play       Start map-aware heuristic Stage 1 with dashboard enabled by default.",
-    "  llm        Start OpenAI-compatible Stage 1 with dashboard enabled by default.",
+    "  llm        Start OpenAI-compatible Stage 1 with dashboard enabled by default; --policy-file supplies a generated-policy guide.",
     "  ui         Start the dashboard alias.",
     "  doctor     Run preflight alias.",
     "  stop       Stop repo-started harness/dashboard Node processes; leaves mGBA alone.",
@@ -420,7 +420,8 @@ async function startControlledRun(kind: "play" | "llm", options: CliOptions, io:
   const response = await requestControl(control.url, `/api/control/${kind}`, {
     maxSteps: options.maxSteps,
     runId: config.harnessRunId,
-    mode: config.harnessMode
+    mode: config.harnessMode,
+    policyFile: options.policyFile
   }, factories);
   io.stdout(redactSecrets({ command: kind, dashboardUrl: control.url, response: response.body }));
 
@@ -590,7 +591,9 @@ async function createRunner(config: HarnessConfig, options: RunnerCommandOptions
     ? await GeneratedHeuristicPolicy.fromFile(options.policyFile)
     : new HeuristicPolicy();
   const policy = isLlmProvider(config.aiProvider)
-    ? LLMPolicy.fromConfig(config, heuristicPolicy)
+    ? LLMPolicy.fromConfig(config, heuristicPolicy, options.policyFile !== undefined && heuristicPolicy instanceof GeneratedHeuristicPolicy
+      ? { guidePolicy: heuristicPolicy, guideDescription: heuristicPolicy.getDefinition() }
+      : {})
     : heuristicPolicy;
 
   return new HarnessRunner({

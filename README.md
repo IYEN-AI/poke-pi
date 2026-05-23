@@ -107,7 +107,7 @@ npm run poke -- stop
 | `npm run poke -- scout --max-steps 300 --run-id scout-1` | Alias for `play` that names the intent: cheap map/state/action evidence collection. | Feed Hermes/policy synthesis. |
 | `npm run poke -- synthesize-policy --from-run scout-1 --policy-id pallet-v1` | Creates `policies/generated/pallet-v1.json`, a schema-validated heuristic policy DSL artifact. | Let Hermes turn scout logs into a new executable heuristic. |
 | `npm run poke -- play-policy --policy-file policies/generated/pallet-v1.json --run-id exec-1` | Executes a generated JSON heuristic policy through the normal harness runner. | Validate synthesized policies before using expensive LLM execution. |
-| `npm run poke -- llm --max-steps 100 --run-id llm-1` | Runs Stage 1 through the configured OpenAI-compatible provider and starts the dashboard. | Compare LLM decisions against heuristic behavior. |
+| `npm run poke -- llm --max-steps 100 --run-id llm-1 --policy-file policies/generated/pallet-v1.json` | Runs Stage 1 through the configured OpenAI-compatible provider and optionally injects a generated policy as a guide. | Use LLM for higher-cost execution while respecting Hermes' synthesized heuristic recommendation. |
 | `npm run poke -- ui --port 3030` | Starts only the web dashboard/control server. | Watch screen/RAM/telemetry, start heuristic or LLM agent runs, and stop the active run. |
 | `npm run poke -- press A --frames 5` | Sends one safe manual button input. | Smoke checks or unblocking a prompt manually. |
 | `npm run poke -- stop` | Stops repo-started Node harness/dashboard processes. Leaves mGBA and mGBA-http alone. | Cleanly stop automation without closing the emulator. |
@@ -137,7 +137,7 @@ The dashboard on `:3030` is also the harness control server. `poke` commands and
 | --- | --- |
 | `GET /api/control/status` | Current active run, last run, and whether a child harness process is running. |
 | `POST /api/control/play` | Start a map-aware heuristic run. JSON body accepts `maxSteps`, `runId`, and `mode`. |
-| `POST /api/control/llm` | Start an OpenAI-compatible LLM run. JSON body accepts `maxSteps`, `runId`, and `mode`. |
+| `POST /api/control/llm` | Start an OpenAI-compatible LLM run. JSON body accepts `maxSteps`, `runId`, `mode`, and optional `policyFile` guide. |
 | `POST /api/control/press` | Send one manual safe button via a short child harness command. JSON body accepts `button` and `frames`. |
 | `POST /api/control/stop` | Stop the active child harness process. |
 | `POST /api/control/clean-failed` | Delete non-completed run directories from `runs/`. |
@@ -185,10 +185,10 @@ Use this when you want “cheap heuristic information gathering → Hermes-gener
 npm run poke -- scout --max-steps 300 --run-id scout-1
 npm run poke -- synthesize-policy --from-run scout-1 --policy-id pallet-v1
 npm run poke -- play-policy --policy-file policies/generated/pallet-v1.json --max-steps 200 --run-id exec-1
-npm run poke -- llm --max-steps 100 --run-id llm-guided-1
+npm run poke -- llm --policy-file policies/generated/pallet-v1.json --max-steps 100 --run-id llm-guided-1
 ```
 
-The generated policy phase is intentionally separate from the LLM phase. Scout runs collect map/action/outcome telemetry cheaply; Hermes can synthesize a JSON policy from those logs; the harness validates and executes that policy; then the LLM can be reserved for higher-cost planning or unresolved states.
+Scout runs collect map/action/outcome telemetry cheaply; Hermes can synthesize a JSON policy from those logs; the harness validates and executes that policy; then the same policy file can be passed to `llm` as a guide. In guided LLM mode, the generated policy produces a recommended decision first; the LLM sees that recommendation plus current RAM/recent action evidence and may follow it or override it with an observed-state rationale.
 
 ### What stays outside the wrapper
 

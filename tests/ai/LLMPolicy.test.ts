@@ -111,6 +111,40 @@ describe("LLMPolicy", () => {
     expect(prompt).not.toContain("Stage 1 route facts");
   });
 
+  it("injects a generated-policy guide decision into the LLM prompt", async () => {
+    const requests: ChatCompletionRequest[] = [];
+    const guideDecision: PolicyDecision = {
+      action: { type: "hold", button: "Right", frames: 18 },
+      rationale: "generated policy pallet-v1/map-explore: choose a map candidate",
+      confidence: 0.62,
+      observedStateCitations: ["generatedPolicy=pallet-v1;rule=map-explore"]
+    };
+    const guidePolicy: Policy = {
+      async chooseAction() {
+        return guideDecision;
+      }
+    };
+    const client = fakeClient(async (request) => {
+      requests.push(request);
+      return JSON.stringify(validDecision);
+    });
+    const policy = createPolicy({
+      client,
+      guidePolicy,
+      guideDescription: { id: "pallet-v1", objective: "execute scout-derived map policy" }
+    });
+
+    await expect(policy.chooseAction(policyInput)).resolves.toEqual(validDecision);
+
+    const prompt = requests[0]?.messages[1]?.content ?? "";
+    expect(prompt).toContain("Generated policy guide supplied by Hermes");
+    expect(prompt).toContain("pallet-v1");
+    expect(prompt).toContain("Recommended policy decision JSON");
+    expect(prompt).toContain("\"button\":\"Right\"");
+    expect(prompt).toContain("Generated-policy guide rule");
+    expect(prompt).toContain("not a direct button command from a human");
+  });
+
 
   it("omits temperature for GPT-5 compatible models that reject sampling parameters", async () => {
     const requests: ChatCompletionRequest[] = [];
@@ -289,6 +323,8 @@ function createPolicy(overrides: {
   maxLlmCalls?: number;
   harnessMode?: "stage1" | "full-game";
   onFallback?: (error: HarnessError) => void;
+  guidePolicy?: Policy;
+  guideDescription?: unknown;
 }): LLMPolicy {
   return new LLMPolicy({
     apiKey: "unit-test-key",
@@ -300,6 +336,8 @@ function createPolicy(overrides: {
     maxLlmCalls: overrides.maxLlmCalls ?? 10,
     harnessMode: overrides.harnessMode,
     fallbackPolicy: createFallbackPolicy(),
+    guidePolicy: overrides.guidePolicy,
+    guideDescription: overrides.guideDescription,
     client: overrides.client,
     onFallback: overrides.onFallback
   });

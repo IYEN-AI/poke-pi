@@ -48,6 +48,8 @@ export interface LLMPolicyOptions {
   maxLlmCalls: number;
   harnessMode?: HarnessMode;
   fallbackPolicy: Policy;
+  guidePolicy?: Policy;
+  guideDescription?: unknown;
   client?: ChatCompletionsClient;
   createClient?: (options: OpenAIClientOptions) => ChatCompletionsClient;
   onFallback?: (error: HarnessError) => void;
@@ -60,6 +62,8 @@ export class LLMPolicy implements Policy {
   private readonly maxLlmCalls: number;
   private readonly harnessMode: HarnessMode;
   private readonly fallbackPolicy: Policy;
+  private readonly guidePolicy?: Policy;
+  private readonly guideDescription?: unknown;
   private readonly onFallback?: (error: HarnessError) => void;
   private calls = 0;
 
@@ -75,10 +79,16 @@ export class LLMPolicy implements Policy {
     this.maxLlmCalls = options.maxLlmCalls;
     this.harnessMode = options.harnessMode ?? "stage1";
     this.fallbackPolicy = options.fallbackPolicy;
+    this.guidePolicy = options.guidePolicy;
+    this.guideDescription = options.guideDescription;
     this.onFallback = options.onFallback;
   }
 
-  static fromConfig(config: HarnessConfig, fallbackPolicy: Policy, overrides: Partial<Pick<LLMPolicyOptions, "client" | "createClient" | "onFallback">> = {}): LLMPolicy {
+  static fromConfig(
+    config: HarnessConfig,
+    fallbackPolicy: Policy,
+    overrides: Partial<Pick<LLMPolicyOptions, "client" | "createClient" | "onFallback" | "guidePolicy" | "guideDescription">> = {}
+  ): LLMPolicy {
     const providerOptions = getProviderOptions(config);
 
     return new LLMPolicy({
@@ -109,10 +119,11 @@ export class LLMPolicy implements Policy {
     this.calls += 1;
 
     try {
+      const guide = await this.buildGuide(input);
       const completion = await this.client.chat.completions.create(buildChatCompletionRequest({
         model: this.model,
         temperature: this.temperature,
-        messages: buildMessages(input, this.harnessMode)
+        messages: buildMessages(input, this.harnessMode, guide)
       }));
       const content = completion.choices[0]?.message?.content;
 
@@ -138,6 +149,30 @@ export class LLMPolicy implements Policy {
     const decision = await this.fallbackPolicy.chooseAction(input);
     return markFallbackDecision(decision, error.code);
   }
+
+  private async buildGuide(input: PolicyInput): Promise<LLMGuideContext | undefined> {
+    if (this.guidePolicy === undefined) {
+      return undefined;
+    }
+
+    try {
+      return {
+        description: this.guideDescription,
+        decision: await this.guidePolicy.chooseAction(input)
+      };
+    } catch (error) {
+      return {
+        description: this.guideDescription,
+        error: error instanceof Error ? error.message : String(error)
+      };
+    }
+  }
+}
+
+interface LLMGuideContext {
+  readonly description?: unknown;
+  readonly decision?: PolicyDecision;
+  readonly error?: string;
 }
 
 function buildChatCompletionRequest(request: Required<Pick<ChatCompletionRequest, "model" | "messages">> & { temperature: number }): ChatCompletionRequest {
@@ -179,9 +214,9 @@ function createOpenAIClient(options: OpenAIClientOptions): ChatCompletionsClient
   return new OpenAI(options);
 }
 
-function buildMessages(input: PolicyInput, harnessMode: HarnessMode): ChatCompletionRequest["messages"] {
+function buildMessages(input: PolicyInput, harnessMode: HarnessMode, guide?: LLMGuideContext): ChatCompletionRequest["messages"] {
   if (harnessMode === "full-game") {
-    return buildFullGameMessages(input);
+    return buildFullGameMessages(input, guide);
   }
 
   return [
@@ -197,15 +232,17 @@ function buildMessages(input: PolicyInput, harnessMode: HarnessMode): ChatComple
         `Current RAM-derived state JSON: ${stableJson(input.currentState ?? input.state)}`,
         `Recent actions summary: ${stableJson(input.recentActions ?? input.recentStates ?? [])}`,
         stage1RouteFacts(),
+        guidePromptSection(guide),
         `Allowed action schema: ${stableJson(createPolicyDecisionJsonSchema())}`,
         "Anti-hardcoding rule: base each decision on the current state and recent action results only; do not follow or emit a precomputed global input timeline.",
+        "Generated-policy guide rule: when a generated policy guide is supplied, treat it as Hermes' current bounded heuristic recommendation. Follow it when it fits the current observation; if you override it, explain the observed-state reason in rationale.",
         "Output only one JSON object matching the allowed policy decision schema. Do not include markdown, comments, or extra text."
       ].join("\n")
     }
   ];
 }
 
-function buildFullGameMessages(input: PolicyInput): ChatCompletionRequest["messages"] {
+function buildFullGameMessages(input: PolicyInput, guide?: LLMGuideContext): ChatCompletionRequest["messages"] {
   return [
     {
       role: "system",
@@ -222,12 +259,28 @@ function buildFullGameMessages(input: PolicyInput): ChatCompletionRequest["messa
         "Do not claim route facts alone, Rival battle exit, or all badges as full-game completion without Hall of Fame observation.",
         `Current RAM-derived state JSON: ${stableJson(input.currentState ?? input.state)}`,
         `Recent actions summary: ${stableJson(input.recentActions ?? input.recentStates ?? [])}`,
+        guidePromptSection(guide),
         `Allowed action schema: ${stableJson(createPolicyDecisionJsonSchema())}`,
         "Anti-hardcoding rule: base each decision on the current state and recent action results only; do not follow or emit a precomputed global input timeline.",
+        "Generated-policy guide rule: when a generated policy guide is supplied, treat it as Hermes' current bounded heuristic recommendation. Follow it when it fits the current observation; if you override it, explain the observed-state reason in rationale.",
         "Output only one JSON object matching the allowed policy decision schema. Do not include markdown, comments, or extra text."
       ].join("\n")
     }
   ];
+}
+
+function guidePromptSection(guide: LLMGuideContext | undefined): string {
+  if (guide === undefined) {
+    return "Generated policy guide: none supplied.";
+  }
+
+  return [
+    "Generated policy guide supplied by Hermes:",
+    `Policy metadata JSON: ${stableJson(guide.description ?? {})}`,
+    guide.decision !== undefined ? `Recommended policy decision JSON: ${stableJson(guide.decision)}` : undefined,
+    guide.error !== undefined ? `Guide policy error: ${guide.error}` : undefined,
+    "This is a bounded heuristic recommendation, not a direct button command from a human."
+  ].filter((line): line is string => line !== undefined).join("\n");
 }
 
 function stage1RouteFacts(): string {
