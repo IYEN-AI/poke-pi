@@ -443,21 +443,25 @@ async function handleStrategyLoop(options: CliOptions, io: CliIo, factories: Cli
   }, factories, true);
   const control = await getControlServer(config, options.dashboardPort, io, factories);
   const startedAt = new Date().toISOString().replace(/[:.]/g, "-");
-  const result = await runStrategyLoop({
-    baseUrl: control.url,
-    maxIterations: options.iterations ?? 12,
-    maxSteps: options.maxSteps ?? 80,
-    pollMs: options.pollMs ?? 2000,
-    llmEvery: options.llmEvery ?? 4,
-    runIdPrefix: options.runIdPrefix ?? `strategy-${startedAt}`,
-    policyIdPrefix: options.policyId ?? `strategy-policy-${startedAt}`,
-    objective: options.objective,
-    request: (baseUrl, pathName, body, method = "POST") => requestControl(baseUrl, pathName, body, factories, method),
-    movementFeedback: () => readLatestMovementFeedback(config.evidenceDir),
-    log: (event) => io.stdout(redactSecrets({ command: "strategy-loop", event }))
-  });
-  io.stdout(redactSecrets({ command: "strategy-loop", dashboardUrl: control.url, result }));
-  return 0;
+  try {
+    const result = await runStrategyLoop({
+      baseUrl: control.url,
+      maxIterations: options.iterations ?? 12,
+      maxSteps: options.maxSteps ?? 80,
+      pollMs: options.pollMs ?? 2000,
+      llmEvery: options.llmEvery ?? 4,
+      runIdPrefix: options.runIdPrefix ?? `strategy-${startedAt}`,
+      policyIdPrefix: options.policyId ?? `strategy-policy-${startedAt}`,
+      objective: options.objective,
+      request: (baseUrl, pathName, body, method = "POST") => requestControl(baseUrl, pathName, body, factories, method),
+      movementFeedback: () => readLatestMovementFeedback(config.evidenceDir),
+      log: (event) => io.stdout(redactSecrets({ command: "strategy-loop", event }))
+    });
+    io.stdout(redactSecrets({ command: "strategy-loop", dashboardUrl: control.url, result }));
+    return 0;
+  } finally {
+    await control.startedHere?.close();
+  }
 }
 
 async function handleStrategyBackground(options: CliOptions, io: CliIo, factories: CliFactories): Promise<number> {

@@ -306,6 +306,44 @@ describe("CLI", () => {
     expect(io.out.join("\n")).toContain('"command": "map-heuristic"');
   });
 
+  it("closes a strategy-loop dashboard that the CLI starts", async () => {
+    const io = createIo();
+    let statusChecks = 0;
+    let dashboardClosed = false;
+
+    const exitCode = await runCli(["strategy-loop", "--iterations", "1", "--max-steps", "1", "--port", "3132"], io, {
+      async controlRequest(_baseUrl, path) {
+        if (path === "/api/control/status") {
+          statusChecks += 1;
+          if (statusChecks === 1) {
+            throw new Error("no existing control server");
+          }
+          return { status: 200, body: { running: false } };
+        }
+        if (path.startsWith("/api/agent/evaluate/")) {
+          return { status: 200, body: { recommendation: "promote_or_reuse_policy" } };
+        }
+        if (path === "/api/agent/run") {
+          return { status: 202, body: { started: true } };
+        }
+        return { status: 404, body: { error: "unexpected" } };
+      },
+      async startDashboard(_config, port) {
+        expect(port).toBe(3132);
+        return {
+          url: "http://127.0.0.1:3132",
+          async close() {
+            dashboardClosed = true;
+          }
+        };
+      }
+    });
+
+    expect(exitCode).toBe(0);
+    expect(dashboardClosed).toBe(true);
+    expect(io.out.join("\n")).toContain('"command": "strategy-loop"');
+  });
+
   it("validates press through the action schema before executing", async () => {
     const io = createIo();
     const actions: unknown[] = [];
