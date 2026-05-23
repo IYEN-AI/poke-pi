@@ -86,7 +86,7 @@ npm run poke -- status
 npm run poke -- play --max-steps 100 --run-id map-1
 ```
 
-3. Open the dashboard printed by the command, or start it separately.
+3. Open the dashboard printed by the command, or start it separately. The page can now start/stop runs and send manual button presses through the same HTTP control server.
 
 ```bash
 npm run poke -- ui --port 3030
@@ -105,7 +105,7 @@ npm run poke -- stop
 | `npm run poke -- status` | Prints redacted config and runs mGBA preflight. | First check when anything looks stuck. |
 | `npm run poke -- play --max-steps 100 --run-id map-1` | Runs Stage 1 with the map-aware heuristic policy and starts the dashboard. | Default autonomous map exploration. |
 | `npm run poke -- llm --max-steps 100 --run-id llm-1` | Runs Stage 1 through the configured OpenAI-compatible provider and starts the dashboard. | Compare LLM decisions against heuristic behavior. |
-| `npm run poke -- ui --port 3030` | Starts only the web dashboard. | Watch screen, RAM state, decisions, and telemetry. |
+| `npm run poke -- ui --port 3030` | Starts only the web dashboard/control server. | Watch screen/RAM/telemetry, start heuristic or LLM runs, stop the active run, and send manual buttons. |
 | `npm run poke -- press A --frames 5` | Sends one safe manual button input. | Smoke checks or unblocking a prompt manually. |
 | `npm run poke -- stop` | Stops repo-started Node harness/dashboard processes. Leaves mGBA and mGBA-http alone. | Cleanly stop automation without closing the emulator. |
 | `npm run poke -- clean-failed --yes` | Deletes run directories whose summary status is not `completed`. | Clean noisy failed attempts from `runs/`. |
@@ -124,7 +124,7 @@ npm run poke -- stop
 
 ### Control server HTTP API
 
-The dashboard on `:3030` is also the harness control server. `poke` commands use these endpoints when possible:
+The dashboard on `:3030` is also the harness control server. `poke` commands and the web UI use these endpoints when possible:
 
 | Endpoint | Meaning |
 | --- | --- |
@@ -193,7 +193,14 @@ Start a local dashboard for live game screen, RAM state, and harness evidence ev
 npm run dashboard -- --port 3030
 ```
 
-Open `http://127.0.0.1:3030`. Keep mGBA, `mGBASocketServer.lua`, and mGBA-http running; the dashboard polls mGBA-http for screenshots/state and reads `runs/` for recent decisions/actions. It also surfaces Pokemon-specific improvement telemetry such as route context, map/x/y/facing, battle HP, screen text, selected action, confidence, checkpoint progress, repeated-state signals, and fallback/low-confidence markers.
+Open `http://127.0.0.1:3030`. Keep mGBA, `mGBASocketServer.lua`, and mGBA-http running; the dashboard polls mGBA-http for screenshots/state and reads `runs/` for recent decisions/actions.
+
+The dashboard UI includes:
+
+- **Control server**: enter `runId`, `maxSteps`, and mode, then start `Play heuristic` or `LLM run`, stop the active child harness, clean failed runs, or send manual `A/B/Start/Select/D-pad` presses.
+- **mGBA screen**: live screenshot stream from mGBA-http, with latest evidence screenshot fallback when mGBA screenshot capture fails.
+- **Map structure**: current map dimensions, tileset, block row/column/id, direction candidates, and visible blocks read from Red/Blue WRAM.
+- **Harness telemetry**: recent run summary, last LLM decision, last button action, route context, map/x/y/facing, battle HP, screen text, selected action, confidence, checkpoint progress, repeated-state signals, and fallback/low-confidence markers.
 
 Start the Stage 1 harness loop with the local heuristic policy:
 

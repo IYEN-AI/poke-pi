@@ -92,6 +92,25 @@ describe("dashboard server", () => {
     expect(spawned[0]?.env.AI_PROVIDER).toBe("heuristic");
   });
 
+  it("renders dashboard controls for HTTP run management and map telemetry", async () => {
+    const evidenceDir = await mkdtemp(path.join(tmpdir(), "poke-pi-dashboard-ui-"));
+    const handle = await startDashboard({ config: config(evidenceDir), port: 0 });
+    handles.push(handle);
+
+    const response = await fetch(`${handle.url}/`);
+    const html = await response.text();
+
+    expect(response.status).toBe(200);
+    expect(html).toContain("Control server");
+    expect(html).toContain("Play heuristic");
+    expect(html).toContain("LLM run");
+    expect(html).toContain("/api/control/status");
+    expect(html).toContain("controlStart('play')");
+    expect(html).toContain("/api/control/press");
+    expect(html).toContain("Map structure");
+    expect(html).toContain("directionCandidates");
+  });
+
 });
 
 function config(evidenceDir: string): HarnessConfig {
