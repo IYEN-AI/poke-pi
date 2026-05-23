@@ -106,7 +106,8 @@ describe("dashboard server", () => {
     expect(html).toContain("LLM run");
     expect(html).toContain("/api/control/status");
     expect(html).toContain("controlStart('play')");
-    expect(html).toContain("/api/control/press");
+    expect(html).not.toContain("Manual input");
+    expect(html).not.toContain("controlPress");
     expect(html).toContain("Map structure");
     expect(html).toContain("directionCandidates");
   });

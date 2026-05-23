@@ -586,8 +586,6 @@ function dashboardHtml(): string {
           <button id="controlCleanFailed">Clean failed</button>
         </div>
         <div class="hud" id="controlSummary" style="grid-template-columns: repeat(2, minmax(0, 1fr)); margin-top: 10px;"></div>
-        <h3 style="margin-top: 12px;">Manual input</h3>
-        <div class="toolbar" id="manualButtons"></div>
         <pre id="controlResponse">ready</pre>
       </section>
       <section>
@@ -683,11 +681,6 @@ async function controlCleanFailed() {
   $('controlResponse').textContent = j(result);
   await refreshRuns();
 }
-async function controlPress(button) {
-  $('controlResponse').textContent = 'pressing ' + button + '...';
-  const result = await postJson('/api/control/press', { button, frames: 5 });
-  $('controlResponse').textContent = j(result);
-}
 function renderMapStructure(live) {
   const map = live?.state?.mapStructure;
   if (!map) {
@@ -746,11 +739,6 @@ $('controlPlay').addEventListener('click', () => void controlStart('play').catch
 $('controlLlm').addEventListener('click', () => void controlStart('llm').catch(e => { setStatus(String(e), false); $('controlResponse').textContent = String(e); }));
 $('controlStop').addEventListener('click', () => void controlStop().catch(e => { setStatus(String(e), false); $('controlResponse').textContent = String(e); }));
 $('controlCleanFailed').addEventListener('click', () => void controlCleanFailed().catch(e => { setStatus(String(e), false); $('controlResponse').textContent = String(e); }));
-$('manualButtons').innerHTML = ['A','B','Start','Select','Up','Down','Left','Right'].map(button => '<button data-button="' + button + '">' + button + '</button>').join('');
-$('manualButtons').addEventListener('click', (event) => {
-  const button = event.target?.dataset?.button;
-  if (button) void controlPress(button).catch(e => { setStatus(String(e), false); $('controlResponse').textContent = String(e); });
-});
 (async function main() {
   try { await refreshConfig(); await refreshControl(); await refreshRuns(); refreshScreen(); setStatus('connected to ' + config.mgbaHttpBaseUrl); }
   catch (e) { setStatus(String(e), false); }
