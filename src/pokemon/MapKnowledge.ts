@@ -1,10 +1,72 @@
-import type { MgbaButton } from "../mgba/MgbaTypes.js";
-import type { PolicyDecision } from "../control/ActionTypes.js";
 import type { PokemonStateSnapshot, RecentStateSnapshot } from "../ai/Policy.js";
+import type { MgbaButton } from "../mgba/MgbaTypes.js";
 import type { PlayerFacingDirection, PokemonMapDirectionCandidate } from "./PokemonTypes.js";
+import type { VisibleMapObservation, VisualTileKind } from "./VisualMap.js";
 
 export type LearnedTileStatus = "visited" | "frontier";
 export type LearnedEdgeStatus = "walkable" | "blocked" | "transition";
+export type VisualEdgeEvidence = "walk_step" | "blocked" | "transition" | "visual_change" | "none";
+
+export type WorldKnowledgeUpdateEntry =
+  | {
+    readonly type: "tile";
+    readonly mapId: number;
+    readonly y: number;
+    readonly x: number;
+    readonly status?: LearnedTileStatus;
+    readonly blockId?: number;
+    readonly visualKind?: VisualTileKind;
+    readonly visualConfidence?: number;
+    readonly visualFingerprint?: string;
+    readonly step?: number;
+  }
+  | {
+    readonly type: "edge";
+    readonly mapId: number;
+    readonly y: number;
+    readonly x: number;
+    readonly direction: PlayerFacingDirection;
+    readonly status: LearnedEdgeStatus;
+    readonly blockId?: number;
+    readonly visualEvidence?: VisualEdgeEvidence;
+    readonly step?: number;
+  }
+  | {
+    readonly type: "map";
+    readonly mapId: number;
+    readonly width?: number;
+    readonly height?: number;
+    readonly tileset?: number;
+    readonly visibleBlockHash?: string;
+    readonly semanticAlias?: string;
+    readonly step?: number;
+  }
+  | {
+    readonly type: "transition";
+    readonly fromMapId: number;
+    readonly fromY: number;
+    readonly fromX: number;
+    readonly toMapId: number;
+    readonly toY: number;
+    readonly toX: number;
+    readonly direction: PlayerFacingDirection;
+    readonly semanticAlias?: string;
+    readonly step?: number;
+  };
+
+export interface WorldKnowledgeUpdate {
+  readonly schema: "pokemon-world-update.v1";
+  readonly source?: string;
+  readonly note?: string;
+  readonly entries: readonly WorldKnowledgeUpdateEntry[];
+}
+
+export interface WorldKnowledgeUpdateResult {
+  readonly schema: "pokemon-world-update-result.v1";
+  readonly applied: number;
+  readonly ignored: number;
+  readonly totals: MapKnowledgeSummary["totals"];
+}
 
 export interface LearnedMapFingerprint {
   readonly mapId: number;
@@ -40,6 +102,10 @@ export interface LearnedMapTile {
   readonly firstSeenStep?: number;
   readonly lastSeenStep?: number;
   readonly blockId?: number;
+  readonly visualKind?: VisualTileKind;
+  readonly visualConfidence?: number;
+  readonly visualFingerprint?: string;
+  readonly visualObservations?: number;
 }
 
 export interface LearnedMapEdge {
@@ -52,6 +118,20 @@ export interface LearnedMapEdge {
   readonly failures: number;
   readonly lastStep?: number;
   readonly blockId?: number;
+  readonly visualEvidence?: VisualEdgeEvidence;
+}
+
+export interface LearnedVisualTile {
+  readonly mapId: number;
+  readonly y: number;
+  readonly x: number;
+  readonly kind: VisualTileKind;
+  readonly confidence: number;
+  readonly fingerprint: string;
+  readonly screenRow: number;
+  readonly screenCol: number;
+  readonly observations: number;
+  readonly lastStep?: number;
 }
 
 export interface MapKnowledgeSummary {
@@ -65,6 +145,7 @@ export interface MapKnowledgeSummary {
     readonly blockedEdges: number;
     readonly transitionEdges: number;
     readonly mapTransitions: number;
+    readonly visualTiles: number;
   };
   readonly currentTile?: LearnedMapTile;
   readonly localFrontierTiles: readonly LearnedMapTile[];
@@ -73,6 +154,7 @@ export interface MapKnowledgeSummary {
   readonly currentMap?: LearnedMapFingerprint;
   readonly knownMaps: readonly LearnedMapFingerprint[];
   readonly recentMapTransitions: readonly LearnedMapTransition[];
+  readonly localVisualTiles: readonly LearnedVisualTile[];
 }
 
 interface MutableTile {
@@ -84,6 +166,10 @@ interface MutableTile {
   firstSeenStep?: number;
   lastSeenStep?: number;
   blockId?: number;
+  visualKind?: VisualTileKind;
+  visualConfidence?: number;
+  visualFingerprint?: string;
+  visualObservations?: number;
 }
 
 interface MutableMapFingerprint {
@@ -119,6 +205,20 @@ interface MutableEdge {
   failures: number;
   lastStep?: number;
   blockId?: number;
+  visualEvidence?: VisualEdgeEvidence;
+}
+
+interface MutableVisualTile {
+  mapId: number;
+  y: number;
+  x: number;
+  kind: VisualTileKind;
+  confidence: number;
+  fingerprint: string;
+  screenRow: number;
+  screenCol: number;
+  observations: number;
+  lastStep?: number;
 }
 
 export class MapKnowledgeTracker {
@@ -126,6 +226,7 @@ export class MapKnowledgeTracker {
   private readonly edges = new Map<string, MutableEdge>();
   private readonly maps = new Map<number, MutableMapFingerprint>();
   private readonly mapTransitions = new Map<string, MutableMapTransition>();
+  private readonly visualTiles = new Map<string, MutableVisualTile>();
   private currentKey: string | undefined;
 
   observeCurrent(state: PokemonStateSnapshot, step?: number): void {
@@ -208,12 +309,90 @@ export class MapKnowledgeTracker {
     this.edges.set(edgeKey, edge);
   }
 
+  observeVisibleMap(state: PokemonStateSnapshot, visibleMap: VisibleMapObservation | undefined, step?: number): void {
+    const location = getLocation(state);
+    if (location === undefined || visibleMap === undefined || !isMappableOverworld(state)) return;
+
+    for (const visualTile of visibleMap.tiles) {
+      if (visualTile.kind === "ui") continue;
+      const y = location.y + visualTile.screenRow - visibleMap.playerScreenTile.row;
+      const x = location.x + visualTile.screenCol - visibleMap.playerScreenTile.col;
+      const key = tileKey(location.mapId, y, x);
+      const existing = this.visualTiles.get(key) ?? {
+        mapId: location.mapId,
+        y,
+        x,
+        kind: visualTile.kind,
+        confidence: visualTile.confidence,
+        fingerprint: visualTile.fingerprint,
+        screenRow: visualTile.screenRow,
+        screenCol: visualTile.screenCol,
+        observations: 0
+      };
+      existing.observations += 1;
+      existing.lastStep = step;
+      if (visualTile.confidence >= existing.confidence || existing.kind === "unknown") {
+        existing.kind = visualTile.kind;
+        existing.confidence = visualTile.confidence;
+        existing.fingerprint = visualTile.fingerprint;
+        existing.screenRow = visualTile.screenRow;
+        existing.screenCol = visualTile.screenCol;
+      }
+      this.visualTiles.set(key, existing);
+
+      const tile = this.tiles.get(key);
+      if (tile !== undefined && (visualTile.confidence >= (tile.visualConfidence ?? 0) || tile.visualKind === "unknown")) {
+        tile.visualKind = visualTile.kind;
+        tile.visualConfidence = visualTile.confidence;
+        tile.visualFingerprint = visualTile.fingerprint;
+        tile.visualObservations = (tile.visualObservations ?? 0) + 1;
+        this.tiles.set(key, tile);
+      }
+    }
+  }
+
+  refineLastDirectionalOutcome(previous: PokemonStateSnapshot | undefined, actionLike: unknown, current: PokemonStateSnapshot, visibleMap: VisibleMapObservation | undefined, step?: number): void {
+    if (previous === undefined || visibleMap === undefined) return;
+    const direction = extractDirection(actionLike);
+    const from = getLocation(previous);
+    const to = getLocation(current);
+    if (direction === undefined || from === undefined || to === undefined) return;
+
+    const edge = this.edges.get(`${tileKey(from.mapId, from.y, from.x)}:${direction}`);
+    if (edge === undefined) return;
+
+    const expected = expectedTarget(from.y, from.x, direction);
+    const targetVisual = this.visualTiles.get(tileKey(from.mapId, expected.y, expected.x));
+    if (sameMap(from, to) && from.y === to.y && from.x === to.x) {
+      edge.visualEvidence = targetVisual?.kind === "obstacle" ? "blocked" : "none";
+    } else if (sameMap(from, to)) {
+      edge.visualEvidence = targetVisual?.kind === "path" || targetVisual?.kind === "grass" ? "walk_step" : "visual_change";
+    } else {
+      edge.visualEvidence = "transition";
+    }
+    edge.lastStep = step;
+    this.edges.set(`${tileKey(from.mapId, from.y, from.x)}:${direction}`, edge);
+  }
+
   isBlocked(mapId: number, y: number, x: number, direction: PlayerFacingDirection): boolean {
     return this.edges.get(`${tileKey(mapId, y, x)}:${direction}`)?.status === "blocked";
   }
 
   candidateStatus(mapId: number, candidate: PokemonMapDirectionCandidate): LearnedTileStatus | undefined {
     return this.tiles.get(tileKey(mapId, candidate.targetY, candidate.targetX))?.status;
+  }
+
+  applyWorldUpdate(update: WorldKnowledgeUpdate): WorldKnowledgeUpdateResult {
+    let applied = 0;
+    let ignored = 0;
+    for (const entry of update.entries) {
+      if (this.applyWorldUpdateEntry(entry)) {
+        applied += 1;
+      } else {
+        ignored += 1;
+      }
+    }
+    return { schema: "pokemon-world-update-result.v1", applied, ignored, totals: this.summarize().totals };
   }
 
   summarize(current?: PokemonStateSnapshot): MapKnowledgeSummary {
@@ -249,7 +428,8 @@ export class MapKnowledgeTracker {
         walkableEdges: [...this.edges.values()].filter((edge) => edge.status === "walkable").length,
         blockedEdges: [...this.edges.values()].filter((edge) => edge.status === "blocked").length,
         transitionEdges: [...this.edges.values()].filter((edge) => edge.status === "transition").length,
-        mapTransitions: this.mapTransitions.size
+        mapTransitions: this.mapTransitions.size,
+        visualTiles: this.visualTiles.size
       },
       currentTile: currentKey === undefined ? undefined : freezeTile(this.tiles.get(currentKey)),
       localFrontierTiles,
@@ -257,7 +437,12 @@ export class MapKnowledgeTracker {
       recentBlockedEdges,
       currentMap,
       knownMaps,
-      recentMapTransitions
+      recentMapTransitions,
+      localVisualTiles: currentLocation === undefined ? [] : [...this.visualTiles.values()]
+        .filter((tile) => tile.mapId === currentLocation.mapId && manhattan(tile, currentLocation) <= 4)
+        .sort((left, right) => manhattan(left, currentLocation) - manhattan(right, currentLocation))
+        .slice(0, 20)
+        .map(freezeVisualTile)
     };
   }
 
@@ -310,6 +495,87 @@ export class MapKnowledgeTracker {
     if (this.tiles.has(key)) return;
     this.tiles.set(key, { mapId, y, x, status: "frontier", visits: 0, firstSeenStep: step, lastSeenStep: step, blockId });
   }
+
+  private applyWorldUpdateEntry(entry: WorldKnowledgeUpdateEntry): boolean {
+    if (entry.type === "tile") {
+      const key = tileKey(entry.mapId, entry.y, entry.x);
+      const existing = this.tiles.get(key) ?? {
+        mapId: entry.mapId,
+        y: entry.y,
+        x: entry.x,
+        status: entry.status ?? "frontier" as LearnedTileStatus,
+        visits: 0,
+        firstSeenStep: entry.step
+      };
+      existing.status = entry.status ?? existing.status;
+      existing.lastSeenStep = entry.step ?? existing.lastSeenStep;
+      existing.blockId = entry.blockId ?? existing.blockId;
+      existing.visualKind = entry.visualKind ?? existing.visualKind;
+      existing.visualConfidence = entry.visualConfidence ?? existing.visualConfidence;
+      existing.visualFingerprint = entry.visualFingerprint ?? existing.visualFingerprint;
+      if (entry.visualKind !== undefined) {
+        existing.visualObservations = (existing.visualObservations ?? 0) + 1;
+      }
+      this.tiles.set(key, existing);
+      return true;
+    }
+
+    if (entry.type === "edge") {
+      const target = expectedTarget(entry.y, entry.x, entry.direction);
+      const key = `${tileKey(entry.mapId, entry.y, entry.x)}:${entry.direction}`;
+      const existing = this.edges.get(key) ?? {
+        from: tileKey(entry.mapId, entry.y, entry.x),
+        to: tileKey(entry.mapId, target.y, target.x),
+        direction: entry.direction,
+        status: entry.status,
+        attempts: 0,
+        successes: 0,
+        failures: 0
+      };
+      existing.status = entry.status;
+      existing.attempts += 1;
+      existing.successes += entry.status === "walkable" || entry.status === "transition" ? 1 : 0;
+      existing.failures += entry.status === "blocked" ? 1 : 0;
+      existing.lastStep = entry.step ?? existing.lastStep;
+      existing.blockId = entry.blockId ?? existing.blockId;
+      existing.visualEvidence = entry.visualEvidence ?? existing.visualEvidence;
+      this.edges.set(key, existing);
+      return true;
+    }
+
+    if (entry.type === "map") {
+      const existing = this.maps.get(entry.mapId) ?? { mapId: entry.mapId, visits: 0, firstSeenStep: entry.step };
+      existing.lastSeenStep = entry.step ?? existing.lastSeenStep;
+      existing.width = entry.width ?? existing.width;
+      existing.height = entry.height ?? existing.height;
+      existing.tileset = entry.tileset ?? existing.tileset;
+      existing.visibleBlockHash = entry.visibleBlockHash ?? existing.visibleBlockHash;
+      existing.semanticAlias = entry.semanticAlias ?? existing.semanticAlias;
+      this.maps.set(entry.mapId, existing);
+      return true;
+    }
+
+    if (entry.type === "transition") {
+      const from = { mapId: entry.fromMapId, y: entry.fromY, x: entry.fromX };
+      const to = { mapId: entry.toMapId, y: entry.toY, x: entry.toX };
+      const key = `${tileKey(from.mapId, from.y, from.x)}:${entry.direction}->${tileKey(to.mapId, to.y, to.x)}`;
+      const existing = this.mapTransitions.get(key) ?? {
+        fromMapId: from.mapId,
+        toMapId: to.mapId,
+        from: tileKey(from.mapId, from.y, from.x),
+        to: tileKey(to.mapId, to.y, to.x),
+        direction: entry.direction,
+        attempts: 0
+      };
+      existing.attempts += 1;
+      existing.lastStep = entry.step ?? existing.lastStep;
+      existing.semanticAlias = entry.semanticAlias ?? existing.semanticAlias;
+      this.mapTransitions.set(key, existing);
+      return true;
+    }
+
+    return false;
+  }
 }
 
 export function mapKnowledgeFromRecent(input: {
@@ -331,7 +597,6 @@ export function mapKnowledgeFromRecent(input: {
 
 function isMappableOverworld(state: PokemonStateSnapshot): boolean {
   const battle = state.wIsInBattle === true || (typeof state.wIsInBattle === "number" && state.wIsInBattle !== 0);
-  const textBoxId = state.wTextBoxID ?? state.textBoxId ?? 0;
   const screenTextKind = typeof state.screenTextKind === "string" ? state.screenTextKind : "none";
   const screenText = typeof state.screenText === "string" ? state.screenText.trim() : "";
   return !battle && screenTextKind !== "oak_intro" && screenTextKind !== "default_name_menu" && screenTextKind !== "naming_screen" && screenText.length === 0;
@@ -409,4 +674,8 @@ function freezeTile(tile: MutableTile | undefined): LearnedMapTile | undefined {
 
 function freezeEdge(edge: MutableEdge): LearnedMapEdge {
   return { ...edge };
+}
+
+function freezeVisualTile(tile: MutableVisualTile): LearnedVisualTile {
+  return { ...tile };
 }
