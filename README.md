@@ -1,0 +1,189 @@
+# TypeScript Pokemon Harness
+
+Stage 1 is the default bounded Pokemon Red and Blue harness mode for mGBA-http. It reads RAM state, records evidence, chooses safe controller actions, and stops at the Stage 1 contract described below. An opt-in full-game mode exists, but it only treats Hall of Fame map observation as completion.
+
+This project does not bundle a ROM. You must provide your own legal Pokemon Red or Pokemon Blue ROM and load it in mGBA yourself.
+
+## Safety First
+
+If an API key was ever pasted into chat, rotate it now. Treat it as exposed. Put new keys only in `.env`, never in source, tests, shell history, README edits, or evidence files.
+
+Run `npm run check:secrets` before sharing changes. The scanner checks project text files for OpenAI-style `sk-` values while skipping generated, dependency, run, and orchestration evidence directories such as `node_modules`, `.git`, `runs`, `coverage`, `dist`, and `.omo`.
+
+The harness never writes emulator memory. It uses safe Game Boy inputs only: `A`, `B`, `Start`, `Select`, `Up`, `Down`, `Left`, and `Right`.
+
+## Setup
+
+1. Install Node.js 20 or newer.
+2. Install dependencies.
+
+```bash
+npm install
+```
+
+3. Copy the example env file.
+
+```bash
+cp .env.example .env
+```
+
+4. Edit `.env` for your local machine. Keep `.env` private.
+
+5. Start mGBA-http, then start mGBA with `mGBASocketServer.lua` loaded and your legal ROM loaded. The harness CLI will not download ROMs.
+
+On macOS, port `5000` may already be owned by Control Center/AirTunes. If so, run mGBA-http on `5001` and set `MGBA_HTTP_BASE_URL=http://127.0.0.1:5001`.
+
+The mGBA 0.10.5 app can load scripts through Tools > Scripting. Newer mGBA HEAD builds also support non-interactive script loading:
+
+```bash
+brew install mgba --HEAD
+mgba --script .local-tools/mgba-http/mGBASocketServer.lua /absolute/path/to/legal/rom.gb
+```
+
+Keep mGBA-http running separately. Download `mGBA-http` and `mGBASocketServer.lua` from the official mGBA-http release, or use the workspace-local `.local-tools/mgba-http/` install if it exists on your machine.
+
+## Environment
+
+Common settings:
+
+```text
+MGBA_HTTP_BASE_URL=http://127.0.0.1:5001
+POKEMON_VERSION=red
+POKEMON_ROM_PATH=/absolute/path/to/legal/rom.gb
+EVIDENCE_DIR=runs
+HARNESS_MODE=stage1
+AI_PROVIDER=heuristic
+```
+
+`HARNESS_MODE` defaults to `stage1`. Set `HARNESS_MODE=full-game` or pass `--mode full-game` to opt into full-game detection. Full-game mode reads badge progress as a signal, but badges alone do not complete the run.
+
+Set `AI_PROVIDER=heuristic` for local deterministic actions, or `AI_PROVIDER=openai` to select actions through the OpenAI-compatible Chat Completions policy. For CodexLB, keep `AI_PROVIDER=openai` and point `OPENAI_BASE_URL` at the CodexLB-compatible endpoint.
+
+```text
+OPENAI_BASE_URL=https://codex.nekos.me/v1
+OPENAI_API_KEY=your-provider-key-in-dotenv-only
+OPENAI_MODEL=gpt-5.5
+OPENAI_TEMPERATURE=0.2
+```
+
+Heuristic mode does not need an API key. `AI_PROVIDER=openai` requires `OPENAI_API_KEY` and sends it only to `OPENAI_BASE_URL`. If `OPENAI_BASE_URL` points at a third-party OpenAI-compatible endpoint, put that provider's key in `OPENAI_API_KEY`; do not send a real OpenAI key to a third-party endpoint. `OPENAI_TEMPERATURE` is the non-secret sampling setting.
+
+## CLI Commands
+
+Show help:
+
+```bash
+npm run harness -- --help
+```
+
+Print a redacted config summary without constructing mGBA or OpenAI clients:
+
+```bash
+npm run harness -- snapshot --dry-run
+```
+
+Run mGBA preflight against your already running mGBA-http service:
+
+```bash
+npm run harness -- preflight
+```
+
+Start the Stage 1 harness loop with the local heuristic policy:
+
+```bash
+npm run harness -- run --policy heuristic --mode stage1 --max-steps 100 --run-id local-stage1
+```
+
+Start a live Stage 1 LLM run through the configured OpenAI-compatible endpoint after setting `OPENAI_API_KEY` privately in `.env`:
+
+```bash
+npm run harness -- run --policy openai --max-steps 100 --run-id local-stage1-openai
+```
+
+Start an opt-in full-game run. Completion is recorded only after observing Hall of Fame map id `0x76` through RAM-derived map state:
+
+```bash
+npm run harness -- run --mode full-game --policy openai --max-steps 1000 --run-id local-full-game
+```
+
+Send one safe button press for manual smoke checks:
+
+```bash
+npm run harness -- press A --frames 5
+```
+
+Run the opt-in real mGBA smoke workflow against an already running mGBA-http service:
+
+```bash
+RUN_MGBA_INTEGRATION=1 MGBA_HTTP_BASE_URL=http://127.0.0.1:5001 npm run smoke:mgba
+```
+
+`npm run smoke:mgba` refuses to contact mGBA unless both `RUN_MGBA_INTEGRATION=1` and `MGBA_HTTP_BASE_URL` are set. When enabled, it runs preflight, records a snapshot, presses safe `B` once, then records a second snapshot. It does not press `A`, start mGBA, open ROMs, load ROMs, or validate ROM files beyond the existing config summary showing whether `POKEMON_ROM_PATH` is present. Evidence is written under `runs/<runId>/` by default, or under `EVIDENCE_DIR/<runId>/` when configured.
+
+Supported common options:
+
+```text
+--dry-run              Snapshot only. Prints config summary and exits.
+--policy heuristic     Use the local heuristic policy.
+--policy openai        Use the OpenAI-compatible policy. Requires OPENAI_API_KEY.
+--mode stage1          Use the default Stage 1 detector.
+--mode full-game       Use the opt-in full-game detector.
+--max-steps N          Override LOOP_MAX_STEPS for snapshot or run.
+--run-id ID            Override HARNESS_RUN_ID for evidence paths.
+```
+
+`press` also accepts `--frames N`.
+
+## Preflight
+
+`preflight` checks the configured mGBA-http endpoint in this order:
+
+1. Config summary.
+2. Current frame endpoint.
+3. `wCurMap` RAM read.
+4. `wYCoord` RAM read.
+5. `wXCoord` RAM read.
+6. Screenshot endpoint.
+7. Safe `B` tap.
+
+If mGBA is absent, the command exits nonzero and prints setup guidance instead of a raw stack trace. Start mGBA manually, enable mGBA-http, load your own ROM, then confirm `MGBA_HTTP_BASE_URL` points to it.
+
+## Stage 1 Contract
+
+Stage 1 means the harness attempts to progress from the Pallet start through Oak and starter flow, starter acquisition, Rival battle entry, and Rival battle exit.
+
+The runner must base each action on current observed RAM state and recent actions. It must not use a global hardcoded input timeline. Evidence includes states, decisions, actions, screenshots, errors, and a final summary under `EVIDENCE_DIR`.
+
+When an LLM-backed provider falls back to the local heuristic policy, the recorded decision rationale and citations are marked with `LLM fallback after <CODE>` so fallback-driven progress is distinguishable from LLM-selected actions.
+
+## Full-Game Mode
+
+Full-game mode is opt in through `HARNESS_MODE=full-game` or `--mode full-game`. It preserves the same safe-input and read-only-RAM rules as Stage 1.
+
+The detector tracks early Stage 1 milestones, badge observation, all-badges observation, and Hall of Fame observation. It does not complete on Rival battle exit or all badges alone. Completion requires observing Hall of Fame map id `0x76` or the derived `hallOfFameComplete` state field.
+
+The LLM full-game prompt treats badges as progress only, forbids memory writes and hardcoded global input timelines, and forbids route-facts-alone completion claims. The local heuristic policy remains a Stage 1-oriented fallback and does not claim reliable full-game clears.
+
+## Tests
+
+Run the default checks:
+
+```bash
+npm run check:secrets
+npm run typecheck
+npm test
+```
+
+Integration tests are opt in so the default suite never contacts mGBA, OpenAI, ROMs, or the network:
+
+```bash
+RUN_MGBA_INTEGRATION=1 MGBA_HTTP_BASE_URL=http://127.0.0.1:5001 npm run test:integration
+```
+
+Only enable integration tests when mGBA-http is already running with your ROM loaded.
+
+The fake smoke workflow test runs in the default suite and uses dependency injection only; it does not contact mGBA.
+
+## Limitations
+
+This is an MVP harness for Pokemon Red and Blue. Stage 1 remains the default and best-supported mode. Full-game mode is an opt-in foundation with read-only progress signals and Hall of Fame-only completion detection; it does not include a full reliable game-clearing strategy. It does not bundle, download, or verify ROM files. It does not start emulator processes. It does not include OBS or Twitch integration. It does not write emulator memory.
