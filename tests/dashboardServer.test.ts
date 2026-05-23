@@ -1,10 +1,10 @@
-import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { EventEmitter } from "node:events";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { EventEmitter } from "node:events";
 import { afterEach, describe, expect, it } from "vitest";
 import type { HarnessConfig } from "../src/config.js";
-import { startDashboard, type DashboardHandle } from "../src/dashboardServer.js";
+import { type DashboardHandle, startDashboard } from "../src/dashboardServer.js";
 
 const handles: DashboardHandle[] = [];
 
@@ -19,12 +19,12 @@ describe("dashboard server", () => {
     await mkdir(runDir, { recursive: true });
     await writeFile(path.join(runDir, "summary.json"), JSON.stringify({ runId: "run-one", status: "failed_timeout", counts: { states: 1, decisions: 1, actions: 1 } }), "utf8");
     await writeFile(path.join(runDir, "config.json"), JSON.stringify({ OPENAI_API_KEY: "secret-token" }), "utf8");
-    await writeFile(path.join(runDir, "events.jsonl"), [
+    await writeFile(path.join(runDir, "events.jsonl"), `${[
       JSON.stringify({ type: "state", sequence: 1, timestamp: "2026-05-23T00:00:00.000Z", payload: { state: { wCurMap: 0 } } }),
       JSON.stringify({ type: "decision", sequence: 1, timestamp: "2026-05-23T00:00:01.000Z", payload: { rationale: "go" } }),
       JSON.stringify({ type: "action", sequence: 1, timestamp: "2026-05-23T00:00:02.000Z", payload: { action: { type: "press", button: "A" } } }),
       JSON.stringify({ type: "pokemon_telemetry", timestamp: "2026-05-23T00:00:03.000Z", payload: { step: 1, frame: 2, route: "pallet_town", categories: ["progress"], location: { mapId: 0, y: 1, x: 10 }, decision: { action: { type: "press", button: "A" }, confidence: 0.8 }, progress: { newCheckpoints: ["initialObserved"] }, improvementSignals: ["checkpoint:initialObserved"] } })
-    ].join("\n") + "\n", "utf8");
+    ].join("\n")}\n`, "utf8");
 
     const handle = await startDashboard({ config: config(evidenceDir), port: 0 });
     handles.push(handle);
@@ -92,6 +92,100 @@ describe("dashboard server", () => {
     expect(spawned[0]?.env.AI_PROVIDER).toBe("heuristic");
   });
 
+  it("exposes Hermes-style agent endpoints for generated policy orchestration", async () => {
+    const evidenceDir = await mkdtemp(path.join(tmpdir(), "poke-pi-dashboard-agent-"));
+    const runDir = path.join(evidenceDir, "scout-one");
+    await mkdir(runDir, { recursive: true });
+    await writeFile(path.join(runDir, "summary.json"), JSON.stringify({ runId: "scout-one", status: "failed_timeout", counts: { decisions: 2 } }), "utf8");
+    await writeFile(path.join(runDir, "events.jsonl"), `${[
+      JSON.stringify({ type: "decision", payload: { decision: { confidence: 0.5 } } }),
+      JSON.stringify({ type: "pokemon_telemetry", payload: { route: "pallet_town", improvementSignals: ["repeated_state_tail"] } })
+    ].join("\n")}\n`, "utf8");
+    const spawned: Array<{ args: readonly string[] }> = [];
+    const handle = await startDashboard({
+      config: config(evidenceDir),
+      port: 0,
+      spawnHarness(args) {
+        const child = Object.assign(new EventEmitter(), {
+          pid: 4321,
+          kill(signal?: string) {
+            child.emit("exit", null, signal ?? "SIGTERM");
+            return true;
+          }
+        });
+        spawned.push({ args });
+        return child as never;
+      }
+    });
+    handles.push(handle);
+
+    const synthesizeResponse = await fetch(`${handle.url}/api/agent/synthesize-policy`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ fromRun: "scout-one", policyId: "pallet-web", policyFile: path.join(evidenceDir, "pallet-web.json") })
+    });
+    const runResponse = await fetch(`${handle.url}/api/agent/run`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ policy: "generated", policyFile: path.join(evidenceDir, "pallet-web.json"), runId: "generated-one", maxSteps: 9 })
+    });
+    await mkdir(path.join(evidenceDir, ".movement-feedback"), { recursive: true });
+    await writeFile(path.join(evidenceDir, ".movement-feedback", "latest.json"), JSON.stringify({ schema: "pokemon-movement-feedback.v1", runId: "scout-one", movementQuality: "blocked", recommendation: "avoid_repeating_last_direction_and_request_visual_reroute", counts: { no_change: 3 }, recentExperiences: [] }), "utf8");
+    const evaluateResponse = await fetch(`${handle.url}/api/agent/evaluate/scout-one`);
+    const movementFeedbackResponse = await fetch(`${handle.url}/api/agent/movement-feedback`);
+
+    expect(synthesizeResponse.status).toBe(200);
+    expect(await synthesizeResponse.json()).toMatchObject({ policy: { id: "pallet-web" } });
+    expect(runResponse.status).toBe(202);
+    expect(spawned[0]?.args).toContain("--policy-file");
+    expect(spawned[0]?.args).toContain(path.join(evidenceDir, "pallet-web.json"));
+    expect(await evaluateResponse.json()).toMatchObject({ schema: "pokemon-agent-run-evaluation.v1", recommendation: "synthesize_or_tune_policy_to_avoid_loops" });
+    expect(await movementFeedbackResponse.json()).toMatchObject({ schema: "pokemon-movement-feedback.v1", runId: "scout-one", movementQuality: "blocked" });
+  });
+
+  it("accepts redacted world-understanding updates from agent clients", async () => {
+    const evidenceDir = await mkdtemp(path.join(tmpdir(), "poke-pi-dashboard-world-update-"));
+    const handle = await startDashboard({ config: config(evidenceDir), port: 0 });
+    handles.push(handle);
+
+    const response = await fetch(`${handle.url}/api/agent/world-update`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        schema: "pokemon-world-update.v1",
+        source: "test-agent",
+        note: "api_key=leaked-token",
+        entries: [
+          { type: "tile", mapId: 1, y: 2, x: 3, status: "visited", visualKind: "path", visualConfidence: 0.7 }
+        ]
+      })
+    });
+
+    const body = await response.json();
+    const events = await readFile(path.join(evidenceDir, ".world-updates", "events.jsonl"), "utf8");
+
+    expect(response.status).toBe(200);
+    expect(body).toMatchObject({ schema: "pokemon-world-update-ack.v1", accepted: true });
+    expect(events).toContain("world_update");
+    expect(events).toContain("pokemon-world-update.v1");
+    expect(events).not.toContain("leaked-token");
+  });
+
+  it("rejects malformed world-understanding updates", async () => {
+    const evidenceDir = await mkdtemp(path.join(tmpdir(), "poke-pi-dashboard-bad-world-update-"));
+    const handle = await startDashboard({ config: config(evidenceDir), port: 0 });
+    handles.push(handle);
+
+    const response = await fetch(`${handle.url}/api/agent/world-update`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ schema: "pokemon-world-update.v1", entries: [{ type: "edge", direction: "north" }] })
+    });
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ error: "invalid_world_update", schema: "pokemon-world-update.v1" });
+  });
+
   it("renders dashboard controls for HTTP run management and map telemetry", async () => {
     const evidenceDir = await mkdtemp(path.join(tmpdir(), "poke-pi-dashboard-ui-"));
     const handle = await startDashboard({ config: config(evidenceDir), port: 0 });
@@ -106,7 +200,12 @@ describe("dashboard server", () => {
     expect(html).toContain("LLM run");
     expect(html).toContain("/api/control/status");
     expect(html).toContain("controlStart('play')");
-    expect(html).toContain("/api/control/press");
+    expect(html).not.toContain("Manual input");
+    expect(html).not.toContain("controlPress");
+    expect(html).toContain("Agent orchestration");
+    expect(html).toContain("/api/agent/observation");
+    expect(html).toContain("/api/agent/movement-feedback");
+    expect(html).toContain("Movement monitor feedback");
     expect(html).toContain("Map structure");
     expect(html).toContain("directionCandidates");
   });

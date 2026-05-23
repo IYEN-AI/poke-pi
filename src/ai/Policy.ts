@@ -1,5 +1,8 @@
+import type { ScreenshotMetadata } from "../evidence/EvidenceRecorder.js";
 import type { PolicyDecision } from "../control/ActionTypes.js";
+import type { MapKnowledgeSummary } from "../pokemon/MapKnowledge.js";
 import type { PokemonMapStructure } from "../pokemon/PokemonTypes.js";
+import type { VisibleMapObservation } from "../pokemon/VisualMap.js";
 
 export interface PokemonStateSnapshot {
   wIsInBattle?: number | boolean;
@@ -28,11 +31,20 @@ export interface PokemonStateSnapshot {
   menuActive?: boolean;
   textActive?: boolean;
   mapStructure?: PokemonMapStructure;
+  mapKnowledge?: MapKnowledgeSummary;
   [key: string]: unknown;
 }
 
 export interface RecentStateSnapshot extends PokemonStateSnapshot {
   step?: number;
+  mapKnowledge?: MapKnowledgeSummary;
+  recentPostActionObservations?: readonly unknown[];
+  visualObservation?: PolicyVisualObservation;
+}
+
+export interface PolicyVisualObservation {
+  readonly screenshot?: ScreenshotMetadata;
+  readonly visibleMap?: VisibleMapObservation;
 }
 
 export interface PolicyInput {
@@ -41,6 +53,9 @@ export interface PolicyInput {
   recentActions?: readonly unknown[];
   recentStates?: readonly RecentStateSnapshot[];
   step?: number;
+  mapKnowledge?: MapKnowledgeSummary;
+  recentPostActionObservations?: readonly unknown[];
+  visualObservation?: PolicyVisualObservation;
 }
 
 export interface Policy {

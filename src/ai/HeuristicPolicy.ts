@@ -1,6 +1,9 @@
 import { PolicyDecisionSchema } from "../control/ActionSchema.js";
-import type { HoldAction, PolicyDecision, PressAction } from "../control/ActionTypes.js";
+import type { HarnessAction, HoldAction, PolicyDecision, PressAction } from "../control/ActionTypes.js";
 import type { MgbaButton } from "../mgba/MgbaTypes.js";
+import { mapKnowledgeFromRecent } from "../pokemon/MapKnowledge.js";
+import type { MapKnowledgeSummary } from "../pokemon/MapKnowledge.js";
+import { MAP_INTERACTION_BLOCK_IDS } from "../pokemon/MapSemantics.js";
 import type { PlayerFacingDirection, PokemonMapDirectionCandidate, PokemonMapStructure } from "../pokemon/PokemonTypes.js";
 import type { Policy, PolicyInput, PokemonStateSnapshot, RecentStateSnapshot } from "./Policy.js";
 
@@ -13,8 +16,8 @@ const PLAYER_FACING_RIGHT = 0x0c;
 
 const EXPLORATORY_BUTTONS = ["Up", "Right", "Down", "Left"] as const;
 const MAP_AWARE_REPEATED_STATE_THRESHOLD = 1;
+const WALL_COLLISION_REPEATED_STATE_THRESHOLD = 2;
 const INTERACTION_REPEATED_STATE_THRESHOLD = 2;
-const MAP_INTERACTION_BLOCK_IDS = new Set([0x03, 0x04, 0x05, 0x06, 0x07, 0x0c, 0x0d, 0x15, 0x16, 0x17, 0x1c, 0x1d, 0x1e, 0x1f, 0x2c, 0x2d, 0x2e]);
 
 export class HeuristicPolicy implements Policy {
   async chooseAction(input: PolicyInput): Promise<PolicyDecision> {
@@ -35,10 +38,11 @@ export class HeuristicPolicy implements Policy {
     }
 
     if (isInBattle(state)) {
+      const battleAction = chooseBattleAction(state);
       return validateDecision({
-        action: press("A"),
-        rationale: "Active battle is visible, so press A to progress battle menus or selected moves without inventing a route.",
-        confidence: 0.72,
+        action: battleAction.action,
+        rationale: battleAction.rationale,
+        confidence: battleAction.confidence,
         observedStateCitations: citations
       });
     }
@@ -92,6 +96,26 @@ export class HeuristicPolicy implements Policy {
       });
     }
 
+    const postStarterRouteOneNavigation = choosePostStarterRouteOneNavigationAction(state, sameCoordRepeats, input.recentActions ?? []);
+    if (postStarterRouteOneNavigation !== undefined) {
+      return validateDecision({
+        action: postStarterRouteOneNavigation.action,
+        rationale: postStarterRouteOneNavigation.rationale,
+        confidence: 0.6,
+        observedStateCitations: citations
+      });
+    }
+
+    const postStarterOverworldNavigation = choosePostStarterOverworldNavigationAction(state);
+    if (postStarterOverworldNavigation !== undefined) {
+      return validateDecision({
+        action: postStarterOverworldNavigation.action,
+        rationale: postStarterOverworldNavigation.rationale,
+        confidence: 0.66,
+        observedStateCitations: citations
+      });
+    }
+
     if (isTextOrMenuActive(state)) {
       const action = shouldBackOutOfRepeatedText(state, sameCoordRepeats) ? press("B") : press("A");
       return validateDecision({
@@ -115,7 +139,13 @@ export class HeuristicPolicy implements Policy {
       });
     }
 
-    const mapAwareDecision = chooseMapAwareExplorationAction(state, input.recentActions ?? [], sameCoordRepeats);
+    const mapKnowledge = input.mapKnowledge ?? state.mapKnowledge ?? mapKnowledgeFromRecent({
+      state,
+      recentStates: input.recentStates,
+      recentActions: input.recentActions,
+      step: input.step
+    }).summarize();
+    const mapAwareDecision = chooseMapAwareExplorationAction(state, input.recentActions ?? [], sameCoordRepeats, mapKnowledge);
     if (mapAwareDecision !== undefined) {
       return validateDecision({
         action: mapAwareDecision.action,
@@ -126,10 +156,10 @@ export class HeuristicPolicy implements Policy {
     }
 
     if (sameCoordRepeats >= REPEATED_STATE_THRESHOLD) {
-      const button = chooseExploratoryButton(state, sameCoordRepeats);
+      const button = chooseExploratoryButton(state, sameCoordRepeats, input.recentActions ?? []);
       return validateDecision({
         action: press(button),
-        rationale: "Overworld coordinates have repeated, so choose a local exploratory direction from the current state hash.",
+        rationale: "Overworld coordinates have repeated, so choose a local exploratory direction from the current state hash while avoiding recent wall-collision directions.",
         confidence: 0.56,
         observedStateCitations: citations
       });
@@ -308,6 +338,10 @@ function press(button: MgbaButton): PressAction {
   return { type: "press", button, frames: DEFAULT_PRESS_FRAMES };
 }
 
+function pressSequence(buttons: readonly MgbaButton[]): HarnessAction {
+  return { type: "sequence", actions: buttons.map((button) => press(button)) };
+}
+
 function hold(button: MgbaButton): HoldAction {
   return { type: "hold", button, frames: DEFAULT_HOLD_FRAMES };
 }
@@ -320,8 +354,35 @@ function isInBattle(state: PokemonStateSnapshot): boolean {
   return state.wIsInBattle === true || (typeof state.wIsInBattle === "number" && state.wIsInBattle !== 0);
 }
 
+function chooseBattleAction(state: PokemonStateSnapshot): { action: HarnessAction; rationale: string; confidence: number } {
+  const screenText = typeof state.screenText === "string" ? state.screenText : "";
+  const lowHp = typeof state.wBattleMonHP === "number" && state.wBattleMonHP <= 3;
+  const wildBattle = state.wIsInBattle === 1 || (typeof state.battle === "object" && state.battle !== null && (state.battle as { kind?: unknown }).kind === "wild");
+  const battleMenuVisible = /FIGHT|ITEM|PKMN|RUN/i.test(screenText);
+
+  if (wildBattle && lowHp && battleMenuVisible) {
+    return {
+      action: pressSequence(["Down", "Right", "A"]),
+      rationale: "Wild battle menu is visible and party HP is critically low, so choose RUN instead of attacking and blocking overworld exploration.",
+      confidence: 0.69
+    };
+  }
+
+  return {
+    action: press("A"),
+    rationale: "Active battle is visible, so press A to progress battle text, menus, or the selected safe move without inventing a route.",
+    confidence: 0.72
+  };
+}
+
 function isTextOrMenuActive(state: PokemonStateSnapshot): boolean {
   const textBoxId = state.wTextBoxID ?? state.textBoxId ?? 0;
+  const screenText = typeof state.screenText === "string" ? state.screenText.trim() : undefined;
+  const screenTextKind = typeof state.screenTextKind === "string" ? state.screenTextKind : undefined;
+
+  if (textBoxId !== 0 && screenText === "" && screenTextKind === "none" && state.wCurMap !== 40) {
+    return state.menuActive === true || state.textActive === true;
+  }
 
   return state.menuActive === true || state.textActive === true || textBoxId !== 0;
 }
@@ -390,6 +451,111 @@ function chooseHomeNavigationAction(
   }
 
   return undefined;
+}
+
+function choosePostStarterRouteOneNavigationAction(
+  state: PokemonStateSnapshot,
+  sameCoordRepeats: number,
+  recentActions: readonly unknown[]
+): Pick<PolicyDecision, "action" | "rationale"> | undefined {
+  if (getPartyCount(state) === 0 || state.wCurMap !== 12 || state.wYCoord === undefined || state.wXCoord === undefined) {
+    return undefined;
+  }
+
+  const screenText = typeof state.screenText === "string" ? state.screenText.trim() : "";
+  const screenTextKind = typeof state.screenTextKind === "string" ? state.screenTextKind : "none";
+  if (screenText.length > 0 || screenTextKind !== "none") {
+    return undefined;
+  }
+
+  return {
+    action: hold(chooseRouteOneStep(state.wYCoord, state.wXCoord, sameCoordRepeats, recentActions)),
+    rationale:
+      "Player is on Route 1 after starter acquisition with only stale empty text flags, so continue northward route exploration instead of waiting for repeated coordinates."
+  };
+}
+
+function chooseRouteOneStep(y: number, x: number, sameCoordRepeats: number, recentActions: readonly unknown[]): MgbaButton {
+  const recentButtons = recentDirectionalButtons(recentActions, 4);
+  const lastButton = lastDirectionalButton(recentActions);
+
+  if (x < 10) return "Right";
+  if (x > 11) return "Left";
+
+  if (x === 11) {
+    if (sameCoordRepeats >= WALL_COLLISION_REPEATED_STATE_THRESHOLD && recentButtons.has("Up")) {
+      return "Right";
+    }
+    return "Up";
+  }
+
+  if (sameCoordRepeats >= WALL_COLLISION_REPEATED_STATE_THRESHOLD && recentButtons.has("Up")) {
+    return lastButton === "Right" ? "Up" : "Right";
+  }
+  return "Up";
+}
+
+function choosePostStarterOverworldNavigationAction(
+  state: PokemonStateSnapshot
+): Pick<PolicyDecision, "action" | "rationale"> | undefined {
+  if (getPartyCount(state) === 0) {
+    return undefined;
+  }
+
+  const mapId = state.wCurMap;
+  const y = state.wYCoord;
+  const x = state.wXCoord;
+  const screenText = typeof state.screenText === "string" ? state.screenText.trim() : "";
+  if (mapId !== 0 || y === undefined || x === undefined || screenText.length > 0) {
+    return undefined;
+  }
+
+  const button = choosePalletTownRoute1Step(y, x);
+  return {
+    action: hold(button),
+    rationale:
+      "Player has a starter and is in Pallet Town with no visible text, so treat empty text RAM flags as stale and route around the lab fence toward Route 1."
+  };
+}
+
+function choosePalletTownRoute1Step(y: number, x: number): MgbaButton {
+  if (y >= 12) {
+    if (x > 5) {
+      return "Left";
+    }
+
+    if (x < 5) {
+      return "Right";
+    }
+
+    return "Up";
+  }
+
+  if (y >= 10) {
+    if (x > 2) {
+      return "Left";
+    }
+
+    if (x < 2) {
+      return "Right";
+    }
+
+    return "Up";
+  }
+
+  if (y > 7) {
+    return "Up";
+  }
+
+  if (x < 10) {
+    return "Right";
+  }
+
+  if (x > 10) {
+    return "Left";
+  }
+
+  return "Up";
 }
 
 function isFreshRedHouseText(
@@ -537,7 +703,8 @@ function normalizeFacingDirection(value: unknown): PlayerFacingDirection | undef
 function chooseMapAwareExplorationAction(
   state: PokemonStateSnapshot,
   recentActions: readonly unknown[],
-  sameCoordRepeats: number
+  sameCoordRepeats: number,
+  mapKnowledge?: MapKnowledgeSummary
 ): Pick<PolicyDecision, "action" | "rationale"> | undefined {
   const mapStructure = state.mapStructure;
   if (mapStructure === undefined || sameCoordRepeats < MAP_AWARE_REPEATED_STATE_THRESHOLD || isTextOrMenuActive(state)) {
@@ -549,9 +716,34 @@ function chooseMapAwareExplorationAction(
     return undefined;
   }
 
-  const recentlyFailedButtons = recentDirectionalButtons(recentActions, Math.min(sameCoordRepeats, 4));
-  const scoredCandidates = candidates
-    .map((candidate) => ({ candidate, score: scoreMapCandidate(candidate, mapStructure, recentlyFailedButtons) }))
+  const recentlyFailedButtons = sameCoordRepeats >= WALL_COLLISION_REPEATED_STATE_THRESHOLD
+    ? recentDirectionalButtons(recentActions, Math.min(sameCoordRepeats + 2, 8))
+    : new Set<MgbaButton>();
+  const learnedBlockedDirections = blockedDirectionsFromKnowledge(mapKnowledge);
+  const unblockedCandidates = candidates.filter((candidate) =>
+    !recentlyFailedButtons.has(directionToButton(candidate.direction)) && !learnedBlockedDirections.has(candidate.direction)
+  );
+  if (unblockedCandidates.length === 0 && recentlyFailedButtons.size > 0) {
+    const probeButton = EXPLORATORY_BUTTONS.find((button) => !recentlyFailedButtons.has(button));
+    if (probeButton !== undefined) {
+      return {
+        action: hold(probeButton),
+        rationale:
+          `Map RAM candidates were recently tried without coordinate movement (${[...recentlyFailedButtons].join(", ")}), ` +
+          `so probe ${probeButton} instead of continuing to push into the same wall.`
+      };
+    }
+
+    return {
+      action: { type: "wait", frames: DEFAULT_WAIT_FRAMES },
+      rationale:
+        `Map RAM has in-bounds candidates, but all candidate directions were recently tried without coordinate movement ` +
+        `(${[...recentlyFailedButtons].join(", ")}), so wait instead of continuing to push into the same wall.`
+    };
+  }
+
+  const scoredCandidates = (unblockedCandidates.length > 0 ? unblockedCandidates : candidates)
+    .map((candidate) => ({ candidate, score: scoreMapCandidate(candidate, mapStructure, recentlyFailedButtons, mapKnowledge) }))
     .sort((left, right) => right.score - left.score || directionPriority(left.candidate.direction) - directionPriority(right.candidate.direction));
   const best = scoredCandidates[0];
   if (best === undefined || best.score < 0) {
@@ -559,18 +751,22 @@ function chooseMapAwareExplorationAction(
   }
 
   const button = directionToButton(best.candidate.direction);
+  const semanticKind = best.candidate.semantic?.kind ?? "unknown";
+  const walkability = best.candidate.semantic?.walkability ?? "unknown";
   return {
     action: hold(button),
     rationale:
       `Map RAM shows ${mapStructure.width}x${mapStructure.height} block map with current block ${formatBlockId(mapStructure.currentBlockId)}; ` +
-      `choose ${button} toward block ${formatBlockId(best.candidate.blockId)} at ${best.candidate.targetY},${best.candidate.targetX} while avoiding recent blocked directions.`
+      `choose ${button} toward ${semanticKind}/${walkability} block ${formatBlockId(best.candidate.blockId)} at ${best.candidate.targetY},${best.candidate.targetX} while avoiding recent/learned blocked directions; ` +
+      `learned map has ${mapKnowledge?.totals.visitedTiles ?? 0} visited tiles, ${mapKnowledge?.totals.frontierTiles ?? 0} frontier tiles, and ${mapKnowledge?.totals.blockedEdges ?? 0} blocked edges.`
   };
 }
 
 function scoreMapCandidate(
   candidate: PokemonMapDirectionCandidate,
   mapStructure: PokemonMapStructure,
-  recentlyFailedButtons: ReadonlySet<MgbaButton>
+  recentlyFailedButtons: ReadonlySet<MgbaButton>,
+  mapKnowledge?: MapKnowledgeSummary
 ): number {
   let score = 0;
   if (candidate.inBounds) {
@@ -582,10 +778,61 @@ function scoreMapCandidate(
   if (candidate.blockId !== mapStructure.currentBlockId) {
     score += 2;
   }
+  if (candidate.semantic?.walkability === "likely_walkable") {
+    score += 3;
+  }
+  if (candidate.semantic?.kind === "grass" || candidate.semantic?.kind === "path") {
+    score += 1;
+  }
+  if (candidate.semantic?.kind === "warp") {
+    score += 2;
+  }
+  if (candidate.semantic?.walkability === "likely_blocked") {
+    score -= 8;
+  }
+  if (candidate.semantic?.interactionCandidate) {
+    score -= 2;
+  }
   if (recentlyFailedButtons.has(directionToButton(candidate.direction))) {
-    score -= 12;
+    score -= 100;
+  }
+  const learnedStatus = learnedCandidateStatus(mapKnowledge, candidate);
+  if (learnedStatus === "frontier") {
+    score += 6;
+  } else if (learnedStatus === "visited") {
+    score -= 3;
+  }
+  if (blockedDirectionsFromKnowledge(mapKnowledge).has(candidate.direction)) {
+    score -= 100;
   }
   return score;
+}
+
+function blockedDirectionsFromKnowledge(mapKnowledge: MapKnowledgeSummary | undefined): ReadonlySet<PlayerFacingDirection> {
+  return new Set((mapKnowledge?.localEdges ?? [])
+    .filter((edge) => edge.status === "blocked")
+    .map((edge) => edge.direction));
+}
+
+function learnedCandidateStatus(
+  mapKnowledge: MapKnowledgeSummary | undefined,
+  candidate: PokemonMapDirectionCandidate
+): "visited" | "frontier" | undefined {
+  if (mapKnowledge === undefined) return undefined;
+  const targetKey = `${mapKnowledge.current?.mapId}:${candidate.targetY}:${candidate.targetX}`;
+  if (mapKnowledge.currentTile !== undefined && `${mapKnowledge.currentTile.mapId}:${mapKnowledge.currentTile.y}:${mapKnowledge.currentTile.x}` === targetKey) {
+    return mapKnowledge.currentTile.status;
+  }
+  if (mapKnowledge.localFrontierTiles.some((tile) => `${tile.mapId}:${tile.y}:${tile.x}` === targetKey)) return "frontier";
+  return mapKnowledge.localEdges.some((edge) => edge.to === targetKey && edge.status === "walkable") ? "visited" : undefined;
+}
+
+function lastDirectionalButton(recentActions: readonly unknown[]): MgbaButton | undefined {
+  for (let index = recentActions.length - 1; index >= 0; index -= 1) {
+    const button = extractDirectionalButton(recentActions[index]);
+    if (button !== undefined) return button;
+  }
+  return undefined;
 }
 
 function recentDirectionalButtons(recentActions: readonly unknown[], limit: number): ReadonlySet<MgbaButton> {
@@ -715,14 +962,20 @@ function countSameCoordinateRepeats(state: PokemonStateSnapshot, recentStates: r
 
 function chooseExploratoryButton(
   state: PokemonStateSnapshot,
-  sameCoordRepeats: number
+  sameCoordRepeats: number,
+  recentActions: readonly unknown[] = []
 ): (typeof EXPLORATORY_BUTTONS)[number] {
+  const recentlyFailedButtons = sameCoordRepeats >= WALL_COLLISION_REPEATED_STATE_THRESHOLD
+    ? recentDirectionalButtons(recentActions, Math.min(sameCoordRepeats + 2, 8))
+    : new Set<MgbaButton>();
+  const availableButtons = EXPLORATORY_BUTTONS.filter((button) => !recentlyFailedButtons.has(button));
+  const buttons = availableButtons.length > 0 ? availableButtons : EXPLORATORY_BUTTONS;
   const hash = [state.wCurMap ?? 0, state.wYCoord ?? 0, state.wXCoord ?? 0, sameCoordRepeats].reduce(
     (total, value) => total * 31 + value,
     7
   );
 
-  return EXPLORATORY_BUTTONS[Math.abs(hash) % EXPLORATORY_BUTTONS.length];
+  return buttons[Math.abs(hash) % buttons.length];
 }
 
 function buildObservedStateCitations(
@@ -755,7 +1008,7 @@ function mapStructureCitation(mapStructure: PokemonMapStructure | undefined): st
   }
 
   const candidates = mapStructure.directionCandidates
-    .map((candidate) => `${candidate.direction}:${candidate.inBounds ? "in" : "out"}:${formatBlockId(candidate.blockId)}`)
+    .map((candidate) => `${candidate.direction}:${candidate.inBounds ? "in" : "out"}:${formatBlockId(candidate.blockId)}:${candidate.semantic?.kind ?? "unknown"}/${candidate.semantic?.walkability ?? "unknown"}`)
     .join(",");
   return `mapStructure=${mapStructure.width}x${mapStructure.height};currentBlock=${formatBlockId(mapStructure.currentBlockId)};candidates=${candidates}`;
 }

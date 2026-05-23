@@ -1,11 +1,13 @@
 import "dotenv/config";
-import { execFile } from "node:child_process";
-import { readdir, readFile, rm } from "node:fs/promises";
+import { execFile, spawn } from "node:child_process";
+import { mkdir, open, readdir, readFile, rm } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import { pathToFileURL } from "node:url";
 import { inspect } from "node:util";
 import { HeuristicPolicy } from "./ai/HeuristicPolicy.js";
+import { GeneratedHeuristicPolicy } from "./ai/generatedPolicy/GeneratedHeuristicPolicy.js";
+import { synthesizeGeneratedPolicy } from "./ai/generatedPolicy/PolicySynthesis.js";
 import { LLMPolicy } from "./ai/LLMPolicy.js";
 import { Controller } from "./control/Controller.js";
 import type { MgbaButton } from "./mgba/MgbaTypes.js";
@@ -23,8 +25,10 @@ import { PokemonStateReader } from "./pokemon/PokemonStateReader.js";
 import { FullGameDetector } from "./pokemon/FullGameDetector.js";
 import { Stage1Detector } from "./pokemon/Stage1Detector.js";
 import { startDashboard, type DashboardHandle } from "./dashboardServer.js";
+import { runStrategyLoop } from "./agent/StrategyLoop.js";
+import { readLatestMovementFeedback, runMovementMonitor } from "./agent/MovementMonitor.js";
 
-type HarnessCommand = "snapshot" | "preflight" | "run" | "press" | "smoke" | "dashboard" | "map-heuristic" | "status" | "play" | "llm" | "ui" | "doctor" | "stop" | "clean-failed";
+type HarnessCommand = "snapshot" | "preflight" | "run" | "press" | "smoke" | "dashboard" | "map-heuristic" | "scout" | "synthesize-policy" | "play-policy" | "strategy-loop" | "strategy-bg" | "movement-monitor" | "movement-monitor-bg" | "status" | "play" | "llm" | "ui" | "doctor" | "stop" | "clean-failed";
 
 export interface CliOptions {
   readonly command?: HarnessCommand;
@@ -39,6 +43,14 @@ export interface CliOptions {
   readonly dashboardPort?: number;
   readonly withDashboard: boolean;
   readonly yes: boolean;
+  readonly fromRun?: string;
+  readonly policyId?: string;
+  readonly policyFile?: string;
+  readonly objective?: string;
+  readonly iterations?: number;
+  readonly pollMs?: number;
+  readonly llmEvery?: number;
+  readonly runIdPrefix?: string;
 }
 
 export interface CliIo {
@@ -48,11 +60,11 @@ export interface CliIo {
 
 export interface CliFactories {
   readonly loadConfig?: (env: NodeJS.ProcessEnv) => HarnessConfig;
-  readonly createRunner?: (config: HarnessConfig, options: RunnerCommandOptions) => CliRunner;
+  readonly createRunner?: (config: HarnessConfig, options: RunnerCommandOptions) => CliRunner | Promise<CliRunner>;
   readonly runPreflight?: (config: HarnessConfig) => Promise<MgbaPreflightReport>;
   readonly executePress?: (config: HarnessConfig, action: unknown) => Promise<void>;
   readonly startDashboard?: (config: HarnessConfig, port?: number) => Promise<DashboardHandle>;
-  readonly controlRequest?: (baseUrl: string, path: string, body?: unknown) => Promise<{ status: number; body: unknown }>;
+  readonly controlRequest?: (baseUrl: string, path: string, body?: unknown, method?: "GET" | "POST") => Promise<{ status: number; body: unknown }>;
 }
 
 export interface CliRunner {
@@ -62,6 +74,7 @@ export interface CliRunner {
 
 interface RunnerCommandOptions {
   readonly maxSteps?: number;
+  readonly policyFile?: string;
 }
 
 interface ParsedOptionResult {
@@ -87,7 +100,14 @@ export function getHarnessHelp(): string {
     "  npm run harness -- run [--policy heuristic|openai] [--mode stage1|full-game] [--max-steps N] [--run-id ID]",
     "  npm run poke -- status",
     "  npm run poke -- play [--max-steps N] [--run-id ID] [--port N]",
-    "  npm run poke -- llm [--max-steps N] [--run-id ID] [--port N]",
+    "  npm run poke -- scout [--max-steps N] [--run-id ID] [--port N]",
+    "  npm run poke -- synthesize-policy --from-run RUN --policy-id ID [--objective TEXT]",
+    "  npm run poke -- play-policy --policy-file policies/generated/ID.json [--max-steps N] [--run-id ID]",
+    "  npm run poke -- llm [--max-steps N] [--run-id ID] [--port N] [--policy-file policies/generated/ID.json]",
+    "  npm run poke -- strategy-loop [--iterations N] [--max-steps N] [--llm-every N] [--poll-ms N] [--port N]",
+    "  npm run poke -- strategy-bg [--iterations N] [--max-steps N] [--llm-every N] [--poll-ms N] [--port N]",
+    "  npm run poke -- movement-monitor [--iterations N] [--poll-ms N] [--port N]",
+    "  npm run poke -- movement-monitor-bg [--iterations N] [--poll-ms N] [--port N]",
     "  npm run poke -- ui [--port N]",
     "  npm run poke -- stop",
     "  npm run poke -- clean-failed --yes",
@@ -101,9 +121,16 @@ export function getHarnessHelp(): string {
     "  preflight  Run mGBA preflight against the manually started service and loaded ROM state.",
     "  run        Start the selected harness loop. Defaults to Stage 1.",
     "  map-heuristic  Run map-aware heuristic exploration; optionally starts the dashboard for the run.",
+    "  scout      Alias for play: collect cheap heuristic map/state/action evidence.",
+    "  synthesize-policy  Create a validated JSON heuristic policy from a scout run.",
+    "  play-policy  Execute a generated JSON heuristic policy artifact.",
+    "  strategy-loop  Poll in foreground and alternate scout/generated/LLM-guided policy runs.",
+    "  strategy-bg  Start strategy-loop as a detached background process and write a log under runs/.strategy/.",
+    "  movement-monitor  Watch active runs and write movement feedback under runs/.movement-feedback/.",
+    "  movement-monitor-bg  Start movement-monitor as a detached background observer.",
     "  status     Print redacted config and mGBA preflight status.",
     "  play       Start map-aware heuristic Stage 1 with dashboard enabled by default.",
-    "  llm        Start OpenAI-compatible Stage 1 with dashboard enabled by default.",
+    "  llm        Start OpenAI-compatible Stage 1 with dashboard enabled by default; --policy-file supplies a generated-policy guide.",
     "  ui         Start the dashboard alias.",
     "  doctor     Run preflight alias.",
     "  stop       Stop repo-started harness/dashboard Node processes; leaves mGBA alone.",
@@ -155,6 +182,30 @@ export function parseCliArgs(args: readonly string[]): ParsedOptionResult {
       case "--yes":
       case "-y":
         options.yes = true;
+        break;
+      case "--from-run":
+        options.fromRun = parseNonEmpty(args[++index], "--from-run", errors);
+        break;
+      case "--policy-id":
+        options.policyId = parseNonEmpty(args[++index], "--policy-id", errors);
+        break;
+      case "--policy-file":
+        options.policyFile = parseNonEmpty(args[++index], "--policy-file", errors);
+        break;
+      case "--objective":
+        options.objective = parseNonEmpty(args[++index], "--objective", errors);
+        break;
+      case "--iterations":
+        options.iterations = parsePositiveInteger(args[++index], "--iterations", errors);
+        break;
+      case "--poll-ms":
+        options.pollMs = parsePositiveInteger(args[++index], "--poll-ms", errors);
+        break;
+      case "--llm-every":
+        options.llmEvery = parsePositiveInteger(args[++index], "--llm-every", errors);
+        break;
+      case "--run-id-prefix":
+        options.runIdPrefix = parseNonEmpty(args[++index], "--run-id-prefix", errors);
         break;
       default:
         if (arg?.startsWith("--") === true) {
@@ -215,6 +266,20 @@ export async function runCli(
         return await handleRun(parsed.options, io, factories);
       case "map-heuristic":
         return await handleMapHeuristic(parsed.options, io, factories);
+      case "scout":
+        return await handleScout(parsed.options, io, factories);
+      case "synthesize-policy":
+        return await handleSynthesizePolicy(parsed.options, io, factories);
+      case "play-policy":
+        return await handlePlayPolicy(parsed.options, io, factories);
+      case "strategy-loop":
+        return await handleStrategyLoop(parsed.options, io, factories);
+      case "strategy-bg":
+        return await handleStrategyBackground(parsed.options, io, factories);
+      case "movement-monitor":
+        return await handleMovementMonitor(parsed.options, io, factories);
+      case "movement-monitor-bg":
+        return await handleMovementMonitorBackground(parsed.options, io, factories);
       case "play":
         return await handlePlay(parsed.options, io, factories);
       case "llm":
@@ -273,7 +338,7 @@ async function handleSnapshot(options: CliOptions, io: CliIo, factories: CliFact
     return 0;
   }
 
-  const runner = (factories.createRunner ?? createRunner)(config, { maxSteps: options.maxSteps });
+  const runner = await (factories.createRunner ?? createRunner)(config, { maxSteps: options.maxSteps, policyFile: options.policyFile });
   const snapshot = await runner.snapshot();
   io.stdout(redactSecrets({ command: "snapshot", snapshot }));
   return 0;
@@ -297,9 +362,9 @@ async function handleStatus(options: CliOptions, io: CliIo, factories: CliFactor
 
 async function handleRun(options: CliOptions, io: CliIo, factories: CliFactories): Promise<number> {
   const config = loadCommandConfig(options, factories);
-  const runner = (factories.createRunner ?? createRunner)(config, { maxSteps: options.maxSteps });
+  const runner = await (factories.createRunner ?? createRunner)(config, { maxSteps: options.maxSteps, policyFile: options.policyFile });
   const result = await runner.run();
-  io.stdout(redactSecrets({ command: "run", result }));
+  io.stdout(redactSecrets({ command: "run", policyFile: options.policyFile, result }));
   return result.status === "completed" ? 0 : 1;
 }
 
@@ -320,7 +385,7 @@ async function handleMapHeuristic(options: CliOptions, io: CliIo, factories: Cli
   }
 
   try {
-    const runner = (factories.createRunner ?? createRunner)(config, { maxSteps: options.maxSteps });
+    const runner = await (factories.createRunner ?? createRunner)(config, { maxSteps: options.maxSteps, policyFile: options.policyFile });
     const result = await runner.run();
     io.stdout(redactSecrets({ command: "map-heuristic", dashboardUrl: dashboard?.url, result }));
     return result.status === "completed" ? 0 : 1;
@@ -329,6 +394,170 @@ async function handleMapHeuristic(options: CliOptions, io: CliIo, factories: Cli
   }
 }
 
+async function handleScout(options: CliOptions, io: CliIo, factories: CliFactories): Promise<number> {
+  return handlePlay({ ...options, runId: options.runId ?? `scout-${Date.now()}` }, io, factories);
+}
+
+async function handleSynthesizePolicy(options: CliOptions, io: CliIo, factories: CliFactories): Promise<number> {
+  const config = loadCommandConfig(options, factories, true);
+  if (options.fromRun === undefined || options.policyId === undefined) {
+    io.stderr("synthesize-policy requires --from-run RUN and --policy-id ID.");
+    return 1;
+  }
+
+  const result = await synthesizeGeneratedPolicy({
+    evidenceDir: config.evidenceDir,
+    fromRun: options.fromRun,
+    policyId: options.policyId,
+    objective: options.objective,
+    outputFile: options.policyFile
+  });
+  io.stdout(redactSecrets({ command: "synthesize-policy", result }));
+  return 0;
+}
+
+async function handlePlayPolicy(options: CliOptions, io: CliIo, factories: CliFactories): Promise<number> {
+  if (options.policyFile === undefined) {
+    io.stderr("play-policy requires --policy-file policies/generated/<id>.json.");
+    return 1;
+  }
+
+  const config = loadCommandConfig({
+    ...options,
+    policy: "heuristic",
+    mode: options.mode ?? "stage1",
+    runId: options.runId ?? `policy-${Date.now()}`
+  }, factories);
+  const runner = await (factories.createRunner ?? createRunner)(config, { maxSteps: options.maxSteps, policyFile: options.policyFile });
+  const result = await runner.run();
+  io.stdout(redactSecrets({ command: "play-policy", policyFile: options.policyFile, result }));
+  return result.status === "completed" ? 0 : 1;
+}
+
+async function handleStrategyLoop(options: CliOptions, io: CliIo, factories: CliFactories): Promise<number> {
+  const config = loadCommandConfig({
+    ...options,
+    policy: "heuristic",
+    mode: options.mode ?? "stage1",
+    runId: options.runId ?? `strategy-${Date.now()}`
+  }, factories, true);
+  const control = await getControlServer(config, options.dashboardPort, io, factories);
+  const startedAt = new Date().toISOString().replace(/[:.]/g, "-");
+  try {
+    const result = await runStrategyLoop({
+      baseUrl: control.url,
+      maxIterations: options.iterations ?? 12,
+      maxSteps: options.maxSteps ?? 80,
+      pollMs: options.pollMs ?? 2000,
+      llmEvery: options.llmEvery ?? 4,
+      runIdPrefix: options.runIdPrefix ?? `strategy-${startedAt}`,
+      policyIdPrefix: options.policyId ?? `strategy-policy-${startedAt}`,
+      objective: options.objective,
+      request: (baseUrl, pathName, body, method = "POST") => requestControl(baseUrl, pathName, body, factories, method),
+      movementFeedback: () => readLatestMovementFeedback(config.evidenceDir),
+      log: (event) => io.stdout(redactSecrets({ command: "strategy-loop", event }))
+    });
+    io.stdout(redactSecrets({ command: "strategy-loop", dashboardUrl: control.url, result }));
+    return 0;
+  } finally {
+    await control.startedHere?.close();
+  }
+}
+
+async function handleStrategyBackground(options: CliOptions, io: CliIo, factories: CliFactories): Promise<number> {
+  if (factories.controlRequest !== undefined || factories.startDashboard !== undefined) {
+    return handleStrategyLoop(options, io, factories);
+  }
+
+  const config = loadCommandConfig(options, factories, true);
+  const logDir = path.join(config.evidenceDir, ".strategy");
+  await mkdir(logDir, { recursive: true });
+  const startedAt = new Date().toISOString().replace(/[:.]/g, "-");
+  const logPath = path.join(logDir, `${options.runIdPrefix ?? "strategy"}-${startedAt}.log`);
+  const logHandle = await open(logPath, "a");
+  const childArgs = [
+    "src/index.ts",
+    "strategy-loop",
+    "--iterations",
+    String(options.iterations ?? 12),
+    "--max-steps",
+    String(options.maxSteps ?? 80),
+    "--poll-ms",
+    String(options.pollMs ?? 2000),
+    "--llm-every",
+    String(options.llmEvery ?? 4),
+    "--port",
+    String(options.dashboardPort ?? 3030),
+    "--run-id-prefix",
+    options.runIdPrefix ?? `strategy-${startedAt}`
+  ];
+  if (options.objective !== undefined) {
+    childArgs.push("--objective", options.objective);
+  }
+  if (options.policyId !== undefined) {
+    childArgs.push("--policy-id", options.policyId);
+  }
+
+  const child = spawn("./node_modules/.bin/tsx", childArgs, {
+    cwd: process.cwd(),
+    env: process.env,
+    detached: true,
+    stdio: ["ignore", logHandle.fd, logHandle.fd]
+  });
+  child.unref();
+  await logHandle.close();
+  io.stdout(redactSecrets({ command: "strategy-bg", pid: child.pid, logPath, args: childArgs }));
+  return 0;
+}
+
+
+async function handleMovementMonitor(options: CliOptions, io: CliIo, factories: CliFactories): Promise<number> {
+  const config = loadCommandConfig(options, factories, true);
+  const baseUrl = controlBaseUrl(options.dashboardPort);
+  const result = await runMovementMonitor({
+    evidenceDir: config.evidenceDir,
+    baseUrl,
+    iterations: options.iterations ?? 120,
+    pollMs: options.pollMs ?? 1000,
+    request: factories.controlRequest === undefined ? undefined : (url, pathName) => factories.controlRequest!(url, pathName, undefined, "GET"),
+    log: (event) => io.stdout(redactSecrets({ command: "movement-monitor", event }))
+  });
+  io.stdout(redactSecrets({ command: "movement-monitor", dashboardUrl: baseUrl, result }));
+  return 0;
+}
+
+async function handleMovementMonitorBackground(options: CliOptions, io: CliIo, factories: CliFactories): Promise<number> {
+  if (factories.controlRequest !== undefined) {
+    return handleMovementMonitor(options, io, factories);
+  }
+
+  const config = loadCommandConfig(options, factories, true);
+  const logDir = path.join(config.evidenceDir, ".movement-monitor");
+  await mkdir(logDir, { recursive: true });
+  const startedAt = new Date().toISOString().replace(/[:.]/g, "-");
+  const logPath = path.join(logDir, `${options.runIdPrefix ?? "movement-monitor"}-${startedAt}.log`);
+  const logHandle = await open(logPath, "a");
+  const childArgs = [
+    "src/index.ts",
+    "movement-monitor",
+    "--iterations",
+    String(options.iterations ?? 3600),
+    "--poll-ms",
+    String(options.pollMs ?? 1000),
+    "--port",
+    String(options.dashboardPort ?? 3030)
+  ];
+  const child = spawn("./node_modules/.bin/tsx", childArgs, {
+    cwd: process.cwd(),
+    env: process.env,
+    detached: true,
+    stdio: ["ignore", logHandle.fd, logHandle.fd]
+  });
+  child.unref();
+  await logHandle.close();
+  io.stdout(redactSecrets({ command: "movement-monitor-bg", pid: child.pid, logPath, args: childArgs }));
+  return 0;
+}
 
 async function handlePlay(options: CliOptions, io: CliIo, factories: CliFactories): Promise<number> {
   return startControlledRun("play", options, io, factories);
@@ -349,7 +578,8 @@ async function startControlledRun(kind: "play" | "llm", options: CliOptions, io:
   const response = await requestControl(control.url, `/api/control/${kind}`, {
     maxSteps: options.maxSteps,
     runId: config.harnessRunId,
-    mode: config.harnessMode
+    mode: config.harnessMode,
+    policyFile: options.policyFile
   }, factories);
   io.stdout(redactSecrets({ command: kind, dashboardUrl: control.url, response: response.body }));
 
@@ -513,11 +743,15 @@ function createSmokeDependencies(config: HarnessConfig): MgbaSmokeWorkflowDepend
   };
 }
 
-function createRunner(config: HarnessConfig, options: RunnerCommandOptions): CliRunner {
+async function createRunner(config: HarnessConfig, options: RunnerCommandOptions): Promise<CliRunner> {
   const client = new MgbaHttpClient({ baseUrl: config.mgbaHttpBaseUrl });
-  const heuristicPolicy = new HeuristicPolicy();
+  const heuristicPolicy = options.policyFile !== undefined
+    ? await GeneratedHeuristicPolicy.fromFile(options.policyFile)
+    : new HeuristicPolicy();
   const policy = isLlmProvider(config.aiProvider)
-    ? LLMPolicy.fromConfig(config, heuristicPolicy)
+    ? LLMPolicy.fromConfig(config, heuristicPolicy, options.policyFile !== undefined && heuristicPolicy instanceof GeneratedHeuristicPolicy
+      ? { guidePolicy: heuristicPolicy, guideDescription: heuristicPolicy.getDefinition() }
+      : {})
     : heuristicPolicy;
 
   return new HarnessRunner({
@@ -566,7 +800,7 @@ async function requestControl(
   method = "POST"
 ): Promise<{ status: number; body: unknown }> {
   if (factories.controlRequest !== undefined) {
-    return factories.controlRequest(baseUrl, pathName, body);
+    return factories.controlRequest(baseUrl, pathName, body, method as "GET" | "POST");
   }
 
   const response = await fetch(`${baseUrl}${pathName}`, {
@@ -743,7 +977,7 @@ function parseNonEmpty(value: string | undefined, name: string, errors: string[]
 }
 
 function isHarnessCommand(value: string): value is HarnessCommand {
-  return value === "snapshot" || value === "preflight" || value === "run" || value === "press" || value === "smoke" || value === "dashboard" || value === "map-heuristic" || value === "status" || value === "play" || value === "llm" || value === "ui" || value === "doctor" || value === "stop" || value === "clean-failed";
+  return value === "snapshot" || value === "preflight" || value === "run" || value === "press" || value === "smoke" || value === "dashboard" || value === "map-heuristic" || value === "scout" || value === "synthesize-policy" || value === "play-policy" || value === "strategy-loop" || value === "strategy-bg" || value === "movement-monitor" || value === "movement-monitor-bg" || value === "status" || value === "play" || value === "llm" || value === "ui" || value === "doctor" || value === "stop" || value === "clean-failed";
 }
 
 interface MutableCliOptions {
@@ -759,6 +993,14 @@ interface MutableCliOptions {
   dashboardPort?: number;
   withDashboard: boolean;
   yes: boolean;
+  fromRun?: string;
+  policyId?: string;
+  policyFile?: string;
+  objective?: string;
+  iterations?: number;
+  pollMs?: number;
+  llmEvery?: number;
+  runIdPrefix?: string;
 }
 
 if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {

@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises";
 import OpenAI from "openai";
 import type { HarnessConfig, HarnessMode } from "../config.js";
 import type { PolicyDecision } from "../control/ActionTypes.js";
@@ -25,10 +26,12 @@ export interface ChatCompletionsClient {
   };
 }
 
+export type ChatMessageContent = string | Array<{ type: "text"; text: string } | { type: "image_url"; image_url: { url: string } }>;
+
 export interface ChatCompletionRequest {
   model: string;
   temperature?: number;
-  messages: Array<{ role: "system" | "user"; content: string }>;
+  messages: Array<{ role: "system" | "user"; content: any }>;
 }
 
 export interface OpenAIClientOptions {
@@ -48,6 +51,8 @@ export interface LLMPolicyOptions {
   maxLlmCalls: number;
   harnessMode?: HarnessMode;
   fallbackPolicy: Policy;
+  guidePolicy?: Policy;
+  guideDescription?: unknown;
   client?: ChatCompletionsClient;
   createClient?: (options: OpenAIClientOptions) => ChatCompletionsClient;
   onFallback?: (error: HarnessError) => void;
@@ -60,6 +65,8 @@ export class LLMPolicy implements Policy {
   private readonly maxLlmCalls: number;
   private readonly harnessMode: HarnessMode;
   private readonly fallbackPolicy: Policy;
+  private readonly guidePolicy?: Policy;
+  private readonly guideDescription?: unknown;
   private readonly onFallback?: (error: HarnessError) => void;
   private calls = 0;
 
@@ -75,10 +82,16 @@ export class LLMPolicy implements Policy {
     this.maxLlmCalls = options.maxLlmCalls;
     this.harnessMode = options.harnessMode ?? "stage1";
     this.fallbackPolicy = options.fallbackPolicy;
+    this.guidePolicy = options.guidePolicy;
+    this.guideDescription = options.guideDescription;
     this.onFallback = options.onFallback;
   }
 
-  static fromConfig(config: HarnessConfig, fallbackPolicy: Policy, overrides: Partial<Pick<LLMPolicyOptions, "client" | "createClient" | "onFallback">> = {}): LLMPolicy {
+  static fromConfig(
+    config: HarnessConfig,
+    fallbackPolicy: Policy,
+    overrides: Partial<Pick<LLMPolicyOptions, "client" | "createClient" | "onFallback" | "guidePolicy" | "guideDescription">> = {}
+  ): LLMPolicy {
     const providerOptions = getProviderOptions(config);
 
     return new LLMPolicy({
@@ -109,10 +122,12 @@ export class LLMPolicy implements Policy {
     this.calls += 1;
 
     try {
+      const guide = await this.buildGuide(input);
+      const messages = await buildMessages(input, this.harnessMode, guide);
       const completion = await this.client.chat.completions.create(buildChatCompletionRequest({
         model: this.model,
         temperature: this.temperature,
-        messages: buildMessages(input, this.harnessMode)
+        messages
       }));
       const content = completion.choices[0]?.message?.content;
 
@@ -138,6 +153,30 @@ export class LLMPolicy implements Policy {
     const decision = await this.fallbackPolicy.chooseAction(input);
     return markFallbackDecision(decision, error.code);
   }
+
+  private async buildGuide(input: PolicyInput): Promise<LLMGuideContext | undefined> {
+    if (this.guidePolicy === undefined) {
+      return undefined;
+    }
+
+    try {
+      return {
+        description: this.guideDescription,
+        decision: await this.guidePolicy.chooseAction(input)
+      };
+    } catch (error) {
+      return {
+        description: this.guideDescription,
+        error: error instanceof Error ? error.message : String(error)
+      };
+    }
+  }
+}
+
+interface LLMGuideContext {
+  readonly description?: unknown;
+  readonly decision?: PolicyDecision;
+  readonly error?: string;
 }
 
 function buildChatCompletionRequest(request: Required<Pick<ChatCompletionRequest, "model" | "messages">> & { temperature: number }): ChatCompletionRequest {
@@ -176,15 +215,15 @@ function markFallbackDecision(decision: PolicyDecision, code: string): PolicyDec
 }
 
 function createOpenAIClient(options: OpenAIClientOptions): ChatCompletionsClient {
-  return new OpenAI(options);
+  return new OpenAI(options) as unknown as ChatCompletionsClient;
 }
 
-function buildMessages(input: PolicyInput, harnessMode: HarnessMode): ChatCompletionRequest["messages"] {
+async function buildMessages(input: PolicyInput, harnessMode: HarnessMode, guide?: LLMGuideContext): Promise<ChatCompletionRequest["messages"]> {
   if (harnessMode === "full-game") {
-    return buildFullGameMessages(input);
+    return buildFullGameMessages(input, guide);
   }
 
-  return [
+  const messages: ChatCompletionRequest["messages"] = [
     {
       role: "system",
       content: "You are a bounded Pokemon Red/Blue controller. Choose only safe Game Boy actions from the supplied schema. Never invent buttons, memory writes, shell commands, code execution, or a hardcoded global input timeline."
@@ -194,19 +233,25 @@ function buildMessages(input: PolicyInput, harnessMode: HarnessMode): ChatComple
       content: [
         "Role: Pokemon Red/Blue controller for an mGBA harness.",
         "Stage 1 objective: progress from the Pallet start through Oak/starter flow, starter acquisition, Rival battle entry, and Rival battle exit using only current observed state.",
-        `Current RAM-derived state JSON: ${stableJson(input.currentState ?? input.state)}`,
+        macroRouteGuidance(),
+        `Current RAM-derived state JSON: ${stableJson(stateWithMapKnowledge(input))}`,
         `Recent actions summary: ${stableJson(input.recentActions ?? input.recentStates ?? [])}`,
         stage1RouteFacts(),
+        guidePromptSection(guide),
         `Allowed action schema: ${stableJson(createPolicyDecisionJsonSchema())}`,
+        sequenceGuidance(),
         "Anti-hardcoding rule: base each decision on the current state and recent action results only; do not follow or emit a precomputed global input timeline.",
+        "Generated-policy guide rule: when a generated policy guide is supplied, treat it as Hermes' current bounded heuristic recommendation. Follow it when it fits the current observation; if you override it, explain the observed-state reason in rationale.",
         "Output only one JSON object matching the allowed policy decision schema. Do not include markdown, comments, or extra text."
       ].join("\n")
     }
   ];
+
+  return withVisualObservation(messages, input);
 }
 
-function buildFullGameMessages(input: PolicyInput): ChatCompletionRequest["messages"] {
-  return [
+async function buildFullGameMessages(input: PolicyInput, guide?: LLMGuideContext): Promise<ChatCompletionRequest["messages"]> {
+  const messages: ChatCompletionRequest["messages"] = [
     {
       role: "system",
       content: "You are a Pokemon Red/Blue full-game controller for an mGBA harness. Choose only safe Game Boy actions from the supplied schema. Never invent buttons, memory writes, emulator RAM mutation, shell commands, code execution, ROM assets, walkthrough text, or a hardcoded global input timeline."
@@ -216,24 +261,104 @@ function buildFullGameMessages(input: PolicyInput): ChatCompletionRequest["messa
       content: [
         "Role: Pokemon Red/Blue controller for an mGBA harness.",
         "Full-game objective: progress through the game using only current observed state and safe controller inputs.",
+        macroRouteGuidance(),
         "Final detector goal: completion can be claimed only when the current observed map is Hall of Fame (map id 0x76) or hallOfFameComplete is true.",
         "Badges are read-only progress signals only; wObtainedBadges, badgeCount, and badgesObtained are not completion by themselves.",
         "Do not request or imply memory writes, emulator RAM mutation APIs, ROM-derived assets, map graphics, walkthrough text, or precomputed global input timelines.",
         "Do not claim route facts alone, Rival battle exit, or all badges as full-game completion without Hall of Fame observation.",
-        `Current RAM-derived state JSON: ${stableJson(input.currentState ?? input.state)}`,
+        `Current RAM-derived state JSON: ${stableJson(stateWithMapKnowledge(input))}`,
         `Recent actions summary: ${stableJson(input.recentActions ?? input.recentStates ?? [])}`,
+        guidePromptSection(guide),
         `Allowed action schema: ${stableJson(createPolicyDecisionJsonSchema())}`,
+        sequenceGuidance(),
         "Anti-hardcoding rule: base each decision on the current state and recent action results only; do not follow or emit a precomputed global input timeline.",
+        "Generated-policy guide rule: when a generated policy guide is supplied, treat it as Hermes' current bounded heuristic recommendation. Follow it when it fits the current observation; if you override it, explain the observed-state reason in rationale.",
         "Output only one JSON object matching the allowed policy decision schema. Do not include markdown, comments, or extra text."
       ].join("\n")
     }
   ];
+
+  return withVisualObservation(messages, input);
+}
+
+async function withVisualObservation(messages: ChatCompletionRequest["messages"], input: PolicyInput): Promise<ChatCompletionRequest["messages"]> {
+  const screenshotPath = input.visualObservation?.screenshot?.path;
+  if (screenshotPath === undefined) {
+    return messages;
+  }
+
+  const dataUrl = await screenshotDataUrl(screenshotPath);
+  if (dataUrl === undefined) {
+    return messages;
+  }
+
+  const [system, user] = messages;
+  if (system === undefined || user === undefined || typeof user.content !== "string") {
+    return messages;
+  }
+
+  return [
+    system,
+    {
+      role: "user",
+      content: [
+        { type: "text", text: `${user.content}\nCurrent screenshot is attached. Use it as a visual local-map prior, but trust RAM/action probes for verified movement facts.` },
+        { type: "image_url", image_url: { url: dataUrl } }
+      ]
+    }
+  ];
+}
+
+async function screenshotDataUrl(path: string): Promise<string | undefined> {
+  try {
+    const data = await readFile(path);
+    return `data:image/png;base64,${data.toString("base64")}`;
+  } catch {
+    return undefined;
+  }
+}
+
+function macroRouteGuidance(): string {
+  return "Macro-route preference: when the current state is stable overworld movement, use the screenshot plus RAM/probe evidence to output a bounded sequence of 4-16 local movement actions rather than a single button. Use shorter/single actions for battle, text, menus, uncertain transitions, or low confidence.";
+}
+
+function sequenceGuidance(): string {
+  return "Sequence guidance: a sequence may contain up to 24 child actions. Prefer holds for walking steps. Keep each macro local and reversible; do not emit a global walkthrough timeline.";
+}
+
+function stateWithMapKnowledge(input: PolicyInput): unknown {
+  const state = input.currentState ?? input.state;
+  if (state === undefined || state === null || typeof state !== "object") {
+    return state;
+  }
+
+  return {
+    ...(state as Record<string, unknown>),
+    mapKnowledge: input.mapKnowledge,
+    recentPostActionObservations: input.recentPostActionObservations
+  };
+}
+
+function guidePromptSection(guide: LLMGuideContext | undefined): string {
+  if (guide === undefined) {
+    return "Generated policy guide: none supplied.";
+  }
+
+  return [
+    "Generated policy guide supplied by Hermes:",
+    `Policy metadata JSON: ${stableJson(guide.description ?? {})}`,
+    guide.decision !== undefined ? `Recommended policy decision JSON: ${stableJson(guide.decision)}` : undefined,
+    guide.error !== undefined ? `Guide policy error: ${guide.error}` : undefined,
+    "This is a bounded heuristic recommendation, not a direct button command from a human."
+  ].filter((line): line is string => line !== undefined).join("\n");
 }
 
 function stage1RouteFacts(): string {
   return [
     "Stage 1 route facts:",
     "Use these as compact map geometry facts for the current wCurMap/wYCoord/wXCoord/screenTextKind/wPartyCount/wIsInBattle/playerFacingDirection/recentActions state, not as a step-numbered global timeline.",
+    "Map knowledge facts are learned from live movement: blocked/walkable edges are verified by coordinate changes; mapTransitions record real mapId changes and should not be merged unless a later semantic alias layer says they are the same place.",
+    "Recent post-action observations are short-cycle probes captured between normal decision-loop iterations; use change.kind plus delta fields to distinguish walk_step, turn_only, blocked_with_visual_change, map_transition, non_adjacent_position_jump, and no_change before choosing the next action.",
     "If boot/title state has all-zero RAM or title/menu-like text, choose current-state menu/title actions such as Start or A until gameplay state appears.",
     "Oak/name flow is text/menu driven: when screenTextKind or recentActions show naming, dialog, or menu prompts, choose the current prompt action rather than walking randomly.",
     "Red House 2F is wCurMap=38: from the bedroom, route toward the stair by getting to x=5 and moving Up onto the stair tile when aligned.",

@@ -50,6 +50,23 @@ export interface MenuTextState {
 
 export type ScreenTextKind = "none" | "oak_intro" | "default_name_menu" | "naming_screen" | "overworld_text";
 
+export type PokemonMapBlockSemanticKind = "path" | "grass" | "water" | "obstacle" | "warp" | "interaction" | "unknown";
+
+export interface PokemonMapBlockSemanticGuess {
+  kind: PokemonMapBlockSemanticKind;
+  walkability: "likely_walkable" | "likely_blocked" | "unknown";
+  interactionCandidate: boolean;
+  source: "static_block_id_hint" | "unclassified_block_id" | "missing_block_id";
+  confidence: number;
+}
+
+export interface PokemonMapBlockObservation {
+  row: number;
+  col: number;
+  blockId?: number;
+  semantic?: PokemonMapBlockSemanticGuess;
+}
+
 export interface PokemonMapDirectionCandidate {
   direction: PlayerFacingDirection;
   targetY: number;
@@ -58,6 +75,7 @@ export interface PokemonMapDirectionCandidate {
   targetBlockCol: number;
   blockId?: number;
   inBounds: boolean;
+  semantic?: PokemonMapBlockSemanticGuess;
 }
 
 export interface PokemonMapStructure {
@@ -70,7 +88,9 @@ export interface PokemonMapStructure {
   currentBlockRow: number;
   currentBlockCol: number;
   currentBlockId?: number;
+  currentBlockSemantic?: PokemonMapBlockSemanticGuess;
   visibleBlocks: readonly (readonly number[])[];
+  semanticVisibleBlocks?: readonly (readonly PokemonMapBlockObservation[])[];
   directionCandidates: readonly PokemonMapDirectionCandidate[];
 }
 

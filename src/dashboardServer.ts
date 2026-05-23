@@ -1,14 +1,20 @@
+import type { ChildProcess } from "node:child_process";
+import { spawn } from "node:child_process";
 import { createReadStream } from "node:fs";
-import { spawn, type ChildProcess } from "node:child_process";
-import { mkdir, readdir, readFile, rm, stat } from "node:fs/promises";
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { appendFile, mkdir, readdir, readFile, rm, stat } from "node:fs/promises";
+import type { IncomingMessage, ServerResponse } from "node:http";
+import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { readLatestMovementFeedback } from "./agent/MovementMonitor.js";
+import { synthesizeGeneratedPolicy } from "./ai/generatedPolicy/PolicySynthesis.js";
 import type { AiProvider, HarnessConfig, HarnessMode } from "./config.js";
+import { evaluateAgentRun } from "./evaluation/RunEvaluation.js";
 import { redactSecrets } from "./evidence/EvidenceRecorder.js";
 import { MgbaHttpClient } from "./mgba/MgbaHttpClient.js";
 import { PokemonStateReader } from "./pokemon/PokemonStateReader.js";
+import { validateWorldKnowledgeUpdate } from "./pokemon/WorldKnowledgeUpdate.js";
 
 export type DashboardSpawnHarness = (args: readonly string[], env: NodeJS.ProcessEnv) => ChildProcess;
 
@@ -77,6 +83,11 @@ async function routeRequest(input: {
       return;
     }
 
+    if (url.pathname.startsWith("/api/agent")) {
+      await routeAgentRequest({ request, response, url, config, client, stateReader, control });
+      return;
+    }
+
     if (request.method !== "GET") {
       sendJson(response, 405, { error: "method_not_allowed" });
       return;
@@ -107,7 +118,7 @@ async function routeRequest(input: {
 
     if (url.pathname === "/api/screenshot" || url.pathname === "/api/screen") {
       const screenshotPath = path.join(liveDir, "latest.png");
-      const servedPath = await captureLiveScreenshotOrLatestEvidence(client, screenshotPath, config.evidenceDir);
+      const servedPath = await captureLiveScreenshotOrLatestEvidence(client, screenshotPath, config.evidenceDir, { preferEvidence: control.isRunning() });
       await sendFile(response, servedPath, "image/png");
       return;
     }
@@ -135,13 +146,14 @@ interface DashboardControlOptions {
   readonly spawnHarness?: DashboardSpawnHarness;
 }
 
-type ControlRunKind = "play" | "llm";
+type ControlRunKind = "play" | "llm" | "policy";
 
 interface ControlRunOptions {
   readonly kind: ControlRunKind;
   readonly maxSteps?: number;
   readonly runId?: string;
   readonly mode?: HarnessMode;
+  readonly policyFile?: string;
 }
 
 class DashboardControl {
@@ -164,6 +176,10 @@ class DashboardControl {
     };
   }
 
+  isRunning(): boolean {
+    return this.child !== undefined;
+  }
+
   start(options: ControlRunOptions): unknown {
     if (this.child !== undefined) {
       return { error: "run_already_active", activeRun: this.activeRun };
@@ -184,13 +200,17 @@ class DashboardControl {
     if (options.maxSteps !== undefined) {
       args.push("--max-steps", String(options.maxSteps));
     }
+    if (options.policyFile !== undefined) {
+      args.push("--policy-file", options.policyFile);
+    }
 
     const env = {
       ...process.env,
       AI_PROVIDER: policy,
       HARNESS_MODE: options.mode ?? "stage1",
       HARNESS_RUN_ID: runId,
-      EVIDENCE_DIR: this.config.evidenceDir
+      EVIDENCE_DIR: this.config.evidenceDir,
+      GENERATED_POLICY_FILE: options.policyFile
     };
     const child = this.spawnHarness(args, env);
     this.child = child;
@@ -270,7 +290,7 @@ async function routeControlRequest(input: {
   }
 
   if (url.pathname === "/api/control/llm") {
-    const result = control.start({ kind: "llm", maxSteps: positiveNumberField(body, "maxSteps"), runId: stringField(body, "runId"), mode: modeField(body) });
+    const result = control.start({ kind: "llm", maxSteps: positiveNumberField(body, "maxSteps"), runId: stringField(body, "runId"), mode: modeField(body), policyFile: stringField(body, "policyFile") });
     sendJson(response, objectField(result, "error") === undefined ? 202 : 409, result);
     return;
   }
@@ -304,6 +324,93 @@ async function routeControlRequest(input: {
   sendJson(response, 404, { error: "not_found" });
 }
 
+async function routeAgentRequest(input: {
+  request: IncomingMessage;
+  response: ServerResponse;
+  url: URL;
+  config: HarnessConfig;
+  client: MgbaHttpClient;
+  stateReader: PokemonStateReader;
+  control: DashboardControl;
+}): Promise<void> {
+  const { request, response, url, config, client, stateReader, control } = input;
+
+  if (request.method === "GET" && url.pathname === "/api/agent/observation") {
+    const live = await readLiveState(client, stateReader);
+    sendJson(response, 200, redactSecrets({ schema: "pokemon-agent-observation.v1", control: control.status(), live }));
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/agent/movement-feedback") {
+    sendJson(response, 200, await readLatestMovementFeedback(config.evidenceDir) ?? { schema: "pokemon-movement-feedback.v1", status: "missing" });
+    return;
+  }
+
+  const evaluateMatch = /^\/api\/agent\/evaluate\/([^/]+)$/.exec(url.pathname);
+  if (request.method === "GET" && evaluateMatch !== null) {
+    sendJson(response, 200, summarizeRunForAgent(await readRun(config.evidenceDir, decodeURIComponent(evaluateMatch[1] ?? ""))));
+    return;
+  }
+
+  if (request.method !== "POST") {
+    sendJson(response, 405, { error: "method_not_allowed" });
+    return;
+  }
+
+  const body = await readJsonBody(request);
+  if (url.pathname === "/api/agent/world-update") {
+    const update = validateWorldKnowledgeUpdate(body);
+    if (update === undefined) {
+      sendJson(response, 400, { error: "invalid_world_update", schema: "pokemon-world-update.v1" });
+      return;
+    }
+    sendJson(response, 200, await recordWorldKnowledgeUpdate(config.evidenceDir, update));
+    return;
+  }
+
+  if (url.pathname === "/api/agent/run") {
+    const requestedPolicy = stringField(body, "policy");
+    const policyFile = stringField(body, "policyFile");
+    if (requestedPolicy !== undefined && !["heuristic", "openai", "generated"].includes(requestedPolicy)) {
+      sendJson(response, 400, { error: "unsupported_policy", allowed: ["heuristic", "openai", "generated"] });
+      return;
+    }
+    if (requestedPolicy === "generated" && policyFile === undefined) {
+      sendJson(response, 400, { error: "missing_policy_file" });
+      return;
+    }
+    const kind: ControlRunKind = requestedPolicy === "openai" ? "llm" : policyFile !== undefined || requestedPolicy === "generated" ? "policy" : "play";
+    const result = control.start({
+      kind,
+      maxSteps: positiveNumberField(body, "maxSteps"),
+      runId: stringField(body, "runId"),
+      mode: modeField(body),
+      policyFile
+    });
+    sendJson(response, objectField(result, "error") === undefined ? 202 : 409, result);
+    return;
+  }
+
+  if (url.pathname === "/api/agent/synthesize-policy") {
+    const fromRun = stringField(body, "fromRun");
+    const policyId = stringField(body, "policyId");
+    if (fromRun === undefined || policyId === undefined) {
+      sendJson(response, 400, { error: "missing_from_run_or_policy_id" });
+      return;
+    }
+    sendJson(response, 200, await synthesizeGeneratedPolicy({
+      evidenceDir: config.evidenceDir,
+      fromRun,
+      policyId,
+      objective: stringField(body, "objective"),
+      outputFile: stringField(body, "policyFile")
+    }));
+    return;
+  }
+
+  sendJson(response, 404, { error: "not_found" });
+}
+
 async function readJsonBody(request: IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = [];
   for await (const chunk of request) {
@@ -318,6 +425,15 @@ async function readJsonBody(request: IncomingMessage): Promise<unknown> {
   } catch {
     return {};
   }
+}
+
+async function recordWorldKnowledgeUpdate(evidenceDir: string, update: unknown): Promise<unknown> {
+  const now = new Date().toISOString();
+  const dir = path.join(evidenceDir, ".world-updates");
+  const event = redactSecrets({ type: "world_update", timestamp: now, payload: update });
+  await mkdir(dir, { recursive: true });
+  await appendFile(path.join(dir, "events.jsonl"), `${JSON.stringify(event)}\n`, "utf8");
+  return { schema: "pokemon-world-update-ack.v1", accepted: true, stored: path.join(dir, "events.jsonl") };
 }
 
 function positiveNumberField(value: unknown, key: string): number | undefined {
@@ -335,7 +451,19 @@ function modeField(value: unknown): HarnessMode | undefined {
   return mode === "stage1" || mode === "full-game" ? mode : undefined;
 }
 
-async function captureLiveScreenshotOrLatestEvidence(client: MgbaHttpClient, liveScreenshotPath: string, evidenceDir: string): Promise<string> {
+async function captureLiveScreenshotOrLatestEvidence(
+  client: MgbaHttpClient,
+  liveScreenshotPath: string,
+  evidenceDir: string,
+  options: { readonly preferEvidence?: boolean } = {}
+): Promise<string> {
+  if (options.preferEvidence === true) {
+    const latest = await findLatestEvidenceScreenshot(evidenceDir);
+    if (latest !== undefined) {
+      return latest;
+    }
+  }
+
   try {
     return await client.screenshot(liveScreenshotPath);
   } catch (error) {
@@ -430,6 +558,19 @@ async function readRun(evidenceDir: string, runId: string): Promise<unknown> {
   const improvementLog = telemetry.map(toImprovementLogEntry).filter((entry) => entry !== undefined);
 
   return redactSecrets({ runId, config, summary, events, lastStateEvent, lastDecision, lastAction, telemetry, improvementLog });
+}
+
+function summarizeRunForAgent(run: unknown): unknown {
+  const summary = summaryObject(objectField(run, "summary"));
+  const improvementLog = Array.isArray(objectField(run, "improvementLog")) ? objectField(run, "improvementLog") as unknown[] : [];
+
+  return redactSecrets(evaluateAgentRun({
+    runId: objectField(run, "runId"),
+    summary,
+    lastDecision: objectField(run, "lastDecision"),
+    lastAction: objectField(run, "lastAction"),
+    improvementLog
+  }));
 }
 
 async function readJsonIfExists(file: string): Promise<unknown> {
@@ -586,9 +727,16 @@ function dashboardHtml(): string {
           <button id="controlCleanFailed">Clean failed</button>
         </div>
         <div class="hud" id="controlSummary" style="grid-template-columns: repeat(2, minmax(0, 1fr)); margin-top: 10px;"></div>
-        <h3 style="margin-top: 12px;">Manual input</h3>
-        <div class="toolbar" id="manualButtons"></div>
         <pre id="controlResponse">ready</pre>
+      </section>
+      <section>
+        <h2>Agent orchestration</h2>
+        <p class="muted">Hermes should observe and launch policies here; it should not send direct gamepad input.</p>
+        <pre>GET /api/agent/observation
+GET /api/agent/evaluate/:runId
+GET /api/agent/movement-feedback
+POST /api/agent/synthesize-policy
+POST /api/agent/run</pre>
       </section>
       <section>
         <h2>Harness run</h2>
@@ -600,6 +748,7 @@ function dashboardHtml(): string {
       </section>
       <section><h3>Last LLM decision</h3><pre id="lastDecision">none</pre></section>
       <section><h3>Last button action</h3><pre id="lastAction">none</pre></section>
+      <section><h3>Movement monitor feedback</h3><div class="hud" id="movementFeedbackSummary" style="grid-template-columns: repeat(2, minmax(0, 1fr));"></div><pre id="movementFeedbackDetails">waiting for external monitor...</pre></section>
       <section><h3>Improvement log</h3><div class="events" id="improvementLog"></div></section>
       <section><h3>Map structure</h3><div class="hud" id="mapSummary" style="grid-template-columns: repeat(2, minmax(0, 1fr));"></div><pre id="mapCandidates">waiting for RAM...</pre></section>
       <section><h3>Live RAM snapshot</h3><pre id="liveState">loading...</pre></section>
@@ -611,6 +760,7 @@ const $ = (id) => document.getElementById(id);
 let selectedRun = null;
 let config = null;
 let lastScreenOkAt = null;
+let screenInFlight = false;
 
 async function getJson(url) {
   const res = await fetch(url, { cache: 'no-store' });
@@ -683,11 +833,6 @@ async function controlCleanFailed() {
   $('controlResponse').textContent = j(result);
   await refreshRuns();
 }
-async function controlPress(button) {
-  $('controlResponse').textContent = 'pressing ' + button + '...';
-  const result = await postJson('/api/control/press', { button, frames: 5 });
-  $('controlResponse').textContent = j(result);
-}
 function renderMapStructure(live) {
   const map = live?.state?.mapStructure;
   if (!map) {
@@ -699,22 +844,27 @@ function renderMapStructure(live) {
     available: 'yes',
     size: String(map.width ?? '?') + 'x' + String(map.height ?? '?'),
     tileset: map.tileset ?? '?',
-    block: map.currentBlock?.id ?? '?',
-    row: map.currentBlock?.row ?? '?',
-    col: map.currentBlock?.col ?? '?',
+    block: map.currentBlockId ?? map.currentBlock?.id ?? '?',
+    semantic: map.currentBlockSemantic?.kind ?? '?',
+    walkability: map.currentBlockSemantic?.walkability ?? '?',
+    row: map.currentBlockRow ?? map.currentBlock?.row ?? '?',
+    col: map.currentBlockCol ?? map.currentBlock?.col ?? '?',
     pointer: map.currentViewPointer ?? '?'
   });
   $('mapCandidates').textContent = j({
-    currentBlock: map.currentBlock,
+    currentBlock: { id: map.currentBlockId, row: map.currentBlockRow, col: map.currentBlockCol, semantic: map.currentBlockSemantic },
     directionCandidates: map.directionCandidates,
+    semanticVisibleBlocks: map.semanticVisibleBlocks,
     visibleBlocks: map.visibleBlocks
   });
 }
 async function refreshConfig() { config = await getJson('/api/config'); }
 function refreshScreen() {
+  if (screenInFlight) return;
+  screenInFlight = true;
   const img = $('screen');
-  img.onload = () => { lastScreenOkAt = new Date(); $('screenMeta').textContent = 'screen refreshed · ' + lastScreenOkAt.toLocaleTimeString(); };
-  img.onerror = () => setStatus('screen unavailable', false);
+  img.onload = () => { screenInFlight = false; lastScreenOkAt = new Date(); $('screenMeta').textContent = 'screen refreshed · ' + lastScreenOkAt.toLocaleTimeString(); };
+  img.onerror = () => { screenInFlight = false; setStatus('screen unavailable', false); };
   img.src = '/api/screen?t=' + Date.now();
 }
 async function refreshLive() {
@@ -723,6 +873,16 @@ async function refreshLive() {
   renderMapStructure(live);
   $('liveState').textContent = j(live.state);
   if (lastScreenOkAt) $('screenMeta').textContent = 'frame ' + live.frame + ' · screen ' + lastScreenOkAt.toLocaleTimeString() + ' · state ' + live.readAt;
+}
+async function refreshMovementFeedback() {
+  const feedback = await getJson('/api/agent/movement-feedback');
+  renderMetrics('movementFeedbackSummary', {
+    status: feedback.status ?? 'available',
+    run: feedback.runId ?? 'none',
+    quality: feedback.movementQuality ?? 'unknown',
+    recommendation: feedback.recommendation ?? 'none'
+  });
+  $('movementFeedbackDetails').textContent = j({ counts: feedback.counts, recentExperiences: feedback.recentExperiences });
 }
 async function refreshRuns() {
   const runs = await getJson('/api/runs');
@@ -746,18 +906,14 @@ $('controlPlay').addEventListener('click', () => void controlStart('play').catch
 $('controlLlm').addEventListener('click', () => void controlStart('llm').catch(e => { setStatus(String(e), false); $('controlResponse').textContent = String(e); }));
 $('controlStop').addEventListener('click', () => void controlStop().catch(e => { setStatus(String(e), false); $('controlResponse').textContent = String(e); }));
 $('controlCleanFailed').addEventListener('click', () => void controlCleanFailed().catch(e => { setStatus(String(e), false); $('controlResponse').textContent = String(e); }));
-$('manualButtons').innerHTML = ['A','B','Start','Select','Up','Down','Left','Right'].map(button => '<button data-button="' + button + '">' + button + '</button>').join('');
-$('manualButtons').addEventListener('click', (event) => {
-  const button = event.target?.dataset?.button;
-  if (button) void controlPress(button).catch(e => { setStatus(String(e), false); $('controlResponse').textContent = String(e); });
-});
 (async function main() {
-  try { await refreshConfig(); await refreshControl(); await refreshRuns(); refreshScreen(); setStatus('connected to ' + config.mgbaHttpBaseUrl); }
+  try { await refreshConfig(); await refreshControl(); await refreshMovementFeedback(); await refreshRuns(); refreshScreen(); setStatus('connected to ' + config.mgbaHttpBaseUrl); }
   catch (e) { setStatus(String(e), false); }
-  setInterval(refreshScreen, 500);
-  setInterval(() => refreshLive().then(() => setStatus('live')).catch(e => setStatus('RAM unavailable; screen may use latest frame', false)), 1500);
-  setInterval(() => refreshControl().catch(e => setStatus(String(e), false)), 1500);
-  setInterval(() => refreshRuns().catch(e => setStatus(String(e), false)), 2500);
+  setInterval(refreshScreen, 1000);
+  setInterval(() => refreshLive().then(() => setStatus('live')).catch(e => setStatus('RAM unavailable; screen may use latest frame', false)), 2500);
+  setInterval(() => refreshControl().catch(e => setStatus(String(e), false)), 2000);
+  setInterval(() => refreshMovementFeedback().catch(e => setStatus(String(e), false)), 2000);
+  setInterval(() => refreshRuns().catch(e => setStatus(String(e), false)), 3500);
 })();
 </script>
 </body>

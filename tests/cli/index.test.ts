@@ -19,6 +19,10 @@ describe("CLI", () => {
     expect(io.out.join("\n")).toContain("play");
     expect(io.out.join("\n")).toContain("status");
     expect(io.out.join("\n")).toContain("clean-failed");
+    expect(io.out.join("\n")).toContain("synthesize-policy");
+    expect(io.out.join("\n")).toContain("play-policy");
+    expect(io.out.join("\n")).toContain("strategy-loop");
+    expect(io.out.join("\n")).toContain("movement-monitor");
     expect(io.out.join("\n")).toContain("heuristic|openai");
     expect(io.out.join("\n")).toContain("stage1|full-game");
   });
@@ -28,6 +32,10 @@ describe("CLI", () => {
     const dashboard = parseCliArgs(["dashboard", "--port", "4040"]);
     const mapHeuristic = parseCliArgs(["map-heuristic", "--max-steps", "12", "--run-id", "map-cli", "--with-dashboard", "--port", "3031"]);
     const play = parseCliArgs(["play", "--max-steps", "5", "--run-id", "easy", "--port", "3032"]);
+    const synthesize = parseCliArgs(["synthesize-policy", "--from-run", "scout-1", "--policy-id", "pallet-v1", "--objective", "find starter"]);
+    const playPolicy = parseCliArgs(["play-policy", "--policy-file", "policies/generated/pallet-v1.json", "--max-steps", "11"]);
+    const strategyLoop = parseCliArgs(["strategy-loop", "--iterations", "3", "--poll-ms", "10", "--llm-every", "2", "--run-id-prefix", "unit"]);
+    const movementMonitor = parseCliArgs(["movement-monitor", "--iterations", "7", "--poll-ms", "20", "--port", "3033"]);
     const cleanFailed = parseCliArgs(["clean-failed", "--yes"]);
 
     expect(parsed.errors).toEqual([]);
@@ -38,6 +46,14 @@ describe("CLI", () => {
     expect(mapHeuristic.options).toMatchObject({ command: "map-heuristic", maxSteps: 12, runId: "map-cli", withDashboard: true, dashboardPort: 3031 });
     expect(play.errors).toEqual([]);
     expect(play.options).toMatchObject({ command: "play", maxSteps: 5, runId: "easy", dashboardPort: 3032 });
+    expect(synthesize.errors).toEqual([]);
+    expect(synthesize.options).toMatchObject({ command: "synthesize-policy", fromRun: "scout-1", policyId: "pallet-v1", objective: "find starter" });
+    expect(playPolicy.errors).toEqual([]);
+    expect(playPolicy.options).toMatchObject({ command: "play-policy", policyFile: "policies/generated/pallet-v1.json", maxSteps: 11 });
+    expect(strategyLoop.errors).toEqual([]);
+    expect(strategyLoop.options).toMatchObject({ command: "strategy-loop", iterations: 3, pollMs: 10, llmEvery: 2, runIdPrefix: "unit" });
+    expect(movementMonitor.errors).toEqual([]);
+    expect(movementMonitor.options).toMatchObject({ command: "movement-monitor", iterations: 7, pollMs: 20, dashboardPort: 3033 });
     expect(cleanFailed.errors).toEqual([]);
     expect(cleanFailed.options).toMatchObject({ command: "clean-failed", yes: true });
   });
@@ -214,7 +230,7 @@ describe("CLI", () => {
     const io = createIo();
     const requests: Array<{ path: string; body: unknown }> = [];
 
-    const exitCode = await withEnv({ OPENAI_API_KEY: "unit-test-key" }, () => runCli(["llm", "--max-steps", "2", "--run-id", "llm-easy"], io, {
+    const exitCode = await withEnv({ OPENAI_API_KEY: "unit-test-key" }, () => runCli(["llm", "--max-steps", "2", "--run-id", "llm-easy", "--policy-file", "policies/generated/pallet-v1.json"], io, {
       async controlRequest(_baseUrl, path, body) {
         requests.push({ path, body });
         if (path === "/api/control/status") {
@@ -227,7 +243,7 @@ describe("CLI", () => {
     expect(exitCode).toBe(0);
     expect(requests).toEqual([
       { path: "/api/control/status", body: undefined },
-      { path: "/api/control/llm", body: { maxSteps: 2, runId: "llm-easy", mode: "stage1" } }
+      { path: "/api/control/llm", body: { maxSteps: 2, runId: "llm-easy", mode: "stage1", policyFile: "policies/generated/pallet-v1.json" } }
     ]);
   });
 
@@ -290,16 +306,60 @@ describe("CLI", () => {
     expect(io.out.join("\n")).toContain('"command": "map-heuristic"');
   });
 
+  it("closes a strategy-loop dashboard that the CLI starts", async () => {
+    const io = createIo();
+    let statusChecks = 0;
+    let dashboardClosed = false;
+
+    const exitCode = await runCli(["strategy-loop", "--iterations", "1", "--max-steps", "1", "--port", "3132"], io, {
+      async controlRequest(_baseUrl, path) {
+        if (path === "/api/control/status") {
+          statusChecks += 1;
+          if (statusChecks === 1) {
+            throw new Error("no existing control server");
+          }
+          return { status: 200, body: { running: false } };
+        }
+        if (path.startsWith("/api/agent/evaluate/")) {
+          return { status: 200, body: { recommendation: "promote_or_reuse_policy" } };
+        }
+        if (path === "/api/agent/run") {
+          return { status: 202, body: { started: true } };
+        }
+        return { status: 404, body: { error: "unexpected" } };
+      },
+      async startDashboard(_config, port) {
+        expect(port).toBe(3132);
+        return {
+          url: "http://127.0.0.1:3132",
+          async close() {
+            dashboardClosed = true;
+          }
+        };
+      }
+    });
+
+    expect(exitCode).toBe(0);
+    expect(dashboardClosed).toBe(true);
+    expect(io.out.join("\n")).toContain('"command": "strategy-loop"');
+  });
+
   it("validates press through the action schema before executing", async () => {
     const io = createIo();
     const actions: unknown[] = [];
 
     const okExit = await runCli(["press", "A", "--frames", "3"], io, {
+      async controlRequest() {
+        throw new Error("no control server in unit test");
+      },
       async executePress(_config, action) {
         actions.push(action);
       }
     });
     const badExit = await runCli(["press", "L", "--frames", "3"], createIo(), {
+      async controlRequest() {
+        throw new Error("no control server in unit test");
+      },
       async executePress(_config, action) {
         actions.push(action);
       }

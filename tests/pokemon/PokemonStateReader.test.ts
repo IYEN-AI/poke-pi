@@ -248,9 +248,13 @@ describe("PokemonStateReader", () => {
       currentBlockCol: 8,
       currentBlockId: 0x44,
       visibleBlocks: expect.arrayContaining([expect.arrayContaining([0x44, 0x45])]),
+      currentBlockSemantic: expect.objectContaining({ kind: "unknown", walkability: "unknown" }),
+      semanticVisibleBlocks: expect.arrayContaining([
+        expect.arrayContaining([expect.objectContaining({ blockId: 0x44, semantic: expect.objectContaining({ kind: "unknown" }) })])
+      ]),
       directionCandidates: expect.arrayContaining([
-        expect.objectContaining({ direction: "right", targetY: 8, targetX: 12, targetBlockRow: 7, targetBlockCol: 9, blockId: 0x45, inBounds: true }),
-        expect.objectContaining({ direction: "down", targetY: 9, targetX: 11, targetBlockRow: 7, targetBlockCol: 8, blockId: 0x44, inBounds: true })
+        expect.objectContaining({ direction: "right", targetY: 8, targetX: 12, targetBlockRow: 7, targetBlockCol: 9, blockId: 0x45, inBounds: true, semantic: expect.objectContaining({ kind: "unknown" }) }),
+        expect.objectContaining({ direction: "down", targetY: 9, targetX: 11, targetBlockRow: 7, targetBlockCol: 8, blockId: 0x44, inBounds: true, semantic: expect.objectContaining({ kind: "unknown" }) })
       ])
     });
   });

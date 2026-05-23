@@ -47,7 +47,7 @@ describe("ActionSchema", () => {
     expect(
       HarnessActionSchema.safeParse({
         type: "sequence",
-        actions: Array.from({ length: 9 }, () => ({ type: "wait", frames: 1 }))
+        actions: Array.from({ length: 25 }, () => ({ type: "wait", frames: 1 }))
       }).success
     ).toBe(false);
 
@@ -67,6 +67,15 @@ describe("ActionSchema", () => {
         ]
       }).success
     ).toBe(false);
+  });
+
+  it("accepts longer bounded macro-route sequences", () => {
+    const result = HarnessActionSchema.safeParse({
+      type: "sequence",
+      actions: Array.from({ length: 24 }, () => ({ type: "hold", button: "Up", frames: 12 }))
+    });
+
+    expect(result.success).toBe(true);
   });
 
   it("accepts valid policy decisions", () => {
