@@ -187,13 +187,15 @@ describe("HarnessRunner", () => {
       type: "post_action_map_observation",
       schema: "pokemon-post-action-observation.v1",
       mapChanged: true,
+      change: { kind: "map_transition", mapIdChanged: true, coordinateChanged: true, adjacentStep: false },
       before: { mapId: 0, y: 1, x: 10 },
       after: { mapId: 12, y: 35, x: 10 }
     });
     expect(pokemonTelemetry).toMatchObject({
       postActionObservation: {
         schema: "pokemon-post-action-observation.v1",
-        mapChanged: true
+        mapChanged: true,
+        change: { kind: "map_transition" }
       }
     });
   });

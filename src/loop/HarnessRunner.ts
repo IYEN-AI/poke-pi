@@ -278,6 +278,7 @@ export class HarnessRunner<TState = PokemonStateSnapshot> {
           action: actionSummary.action,
           before: locationSummary(before),
           after: locationSummary(state),
+          change: classifyPostActionChange(before, state, visualSamples),
           mapChanged: (before.wCurMap ?? before.mapId) !== (state.wCurMap ?? state.mapId),
           pixelChanged: visualSamples.some((sample) => sample.pixelChanged),
           visualSamples,
@@ -295,6 +296,7 @@ export class HarnessRunner<TState = PokemonStateSnapshot> {
       action: actionSummary.action,
       before: locationSummary(before),
       after: locationSummary(before),
+      change: classifyPostActionChange(before, before, visualSamples),
       mapChanged: false,
       pixelChanged: visualSamples.some((sample) => sample.pixelChanged),
       visualSamples,
@@ -551,10 +553,30 @@ interface PostActionObservation {
   readonly action: PolicyDecision["action"];
   readonly before: ReturnType<typeof locationSummary>;
   readonly after: ReturnType<typeof locationSummary>;
+  readonly change: PostActionChange;
   readonly mapChanged: boolean;
   readonly mapKnowledge: unknown;
   readonly pixelChanged: boolean;
   readonly visualSamples: readonly PostActionVisualSample[];
+}
+
+type PostActionTransitionKind =
+  | "no_change"
+  | "blocked_with_visual_change"
+  | "turn_only"
+  | "walk_step"
+  | "map_transition"
+  | "non_adjacent_position_jump"
+  | "visual_only_transition";
+
+interface PostActionChange {
+  readonly kind: PostActionTransitionKind;
+  readonly mapIdChanged: boolean;
+  readonly coordinateChanged: boolean;
+  readonly adjacentStep: boolean;
+  readonly facingChanged: boolean;
+  readonly pixelChanged: boolean;
+  readonly delta: { readonly mapId?: unknown; readonly y?: number; readonly x?: number; readonly manhattan?: number };
 }
 
 interface PostActionVisualSample {
@@ -697,6 +719,57 @@ async function fileHash(path: string): Promise<string | undefined> {
   } catch {
     return undefined;
   }
+}
+
+function classifyPostActionChange(
+  before: PokemonStateSnapshot,
+  after: PokemonStateSnapshot,
+  visualSamples: readonly PostActionVisualSample[]
+): PostActionChange {
+  const beforeMap = before.wCurMap ?? before.mapId;
+  const afterMap = after.wCurMap ?? after.mapId;
+  const beforeY = numberLike(before.wYCoord ?? before.y);
+  const afterY = numberLike(after.wYCoord ?? after.y);
+  const beforeX = numberLike(before.wXCoord ?? before.x);
+  const afterX = numberLike(after.wXCoord ?? after.x);
+  const mapIdChanged = beforeMap !== afterMap;
+  const coordinateChanged = beforeY !== afterY || beforeX !== afterX;
+  const facingChanged = (before.playerFacingDirection ?? before.wSpritePlayerStateData1FacingDirection) !==
+    (after.playerFacingDirection ?? after.wSpritePlayerStateData1FacingDirection);
+  const pixelChanged = visualSamples.some((sample) => sample.pixelChanged);
+  const dy = beforeY !== undefined && afterY !== undefined ? afterY - beforeY : undefined;
+  const dx = beforeX !== undefined && afterX !== undefined ? afterX - beforeX : undefined;
+  const manhattan = dy !== undefined && dx !== undefined ? Math.abs(dy) + Math.abs(dx) : undefined;
+  const adjacentStep = !mapIdChanged && coordinateChanged && manhattan === 1;
+
+  return {
+    kind: classifyTransitionKind({ mapIdChanged, coordinateChanged, adjacentStep, facingChanged, pixelChanged }),
+    mapIdChanged,
+    coordinateChanged,
+    adjacentStep,
+    facingChanged,
+    pixelChanged,
+    delta: { mapId: mapIdChanged ? afterMap : undefined, y: dy, x: dx, manhattan }
+  };
+}
+
+function classifyTransitionKind(input: {
+  readonly mapIdChanged: boolean;
+  readonly coordinateChanged: boolean;
+  readonly adjacentStep: boolean;
+  readonly facingChanged: boolean;
+  readonly pixelChanged: boolean;
+}): PostActionTransitionKind {
+  if (input.mapIdChanged) return "map_transition";
+  if (input.coordinateChanged && input.adjacentStep) return "walk_step";
+  if (input.coordinateChanged) return "non_adjacent_position_jump";
+  if (input.facingChanged) return "turn_only";
+  if (input.pixelChanged) return "blocked_with_visual_change";
+  return "no_change";
+}
+
+function numberLike(value: unknown): number | undefined {
+  return typeof value === "number" ? value : undefined;
 }
 
 function containsDirectionalAction(action: PolicyDecision["action"]): boolean {
