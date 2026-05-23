@@ -9,7 +9,8 @@ import {
   decodeUnsignedByte
 } from "./decoders.js";
 import { HALL_OF_FAME_MAP_ID, RED_BLUE_MEMORY_MAP } from "./memoryMap.js";
-import type { BadgeProgress, BattleFlag, HitPoints, MenuTextState, PartySummary, PlayerFacing, PlayerFacingDirection, PokemonCoordinates, PokemonGameState, PokemonMapDirectionCandidate, PokemonMapStructure } from "./PokemonTypes.js";
+import { classifyMapBlock } from "./MapSemantics.js";
+import type { BadgeProgress, BattleFlag, HitPoints, MenuTextState, PartySummary, PlayerFacing, PlayerFacingDirection, PokemonCoordinates, PokemonGameState, PokemonMapBlockObservation, PokemonMapDirectionCandidate, PokemonMapStructure } from "./PokemonTypes.js";
 
 type RamClient = Pick<MgbaHttpClient, "read8" | "read16" | "readRange">;
 
@@ -82,13 +83,30 @@ function isUsableMapDimension(value: number): boolean {
 }
 
 function readVisibleBlocks(overworldMap: Uint8Array, currentViewPointer: number, stride: number): readonly (readonly number[])[] {
+  return readVisibleBlockObservations(overworldMap, currentViewPointer, stride)
+    .map((row) => row.map((block) => block.blockId ?? 0));
+}
+
+function readVisibleBlockObservations(
+  overworldMap: Uint8Array,
+  currentViewPointer: number,
+  stride: number
+): readonly (readonly PokemonMapBlockObservation[])[] {
   const viewOffset = currentViewPointer - map.wOverworldMap;
   if (viewOffset < 0 || viewOffset >= overworldMap.length) {
     return [];
   }
 
   return Array.from({ length: SCREEN_BLOCK_HEIGHT }, (_rowValue, row) => (
-    Array.from({ length: SCREEN_BLOCK_WIDTH }, (_colValue, col) => overworldMap[viewOffset + row * stride + col] ?? 0)
+    Array.from({ length: SCREEN_BLOCK_WIDTH }, (_colValue, col) => {
+      const blockId = overworldMap[viewOffset + row * stride + col];
+      return {
+        row,
+        col,
+        blockId,
+        semantic: classifyMapBlock(blockId)
+      };
+    })
   ));
 }
 
@@ -120,14 +138,17 @@ function buildDirectionCandidate(
   const targetBlockRow = Math.floor(targetY / 2) + MAP_BORDER;
   const targetBlockCol = Math.floor(targetX / 2) + MAP_BORDER;
 
+  const blockId = blockAt(input.overworldMap, input.stride, targetBlockRow, targetBlockCol);
+
   return {
     direction,
     targetY,
     targetX,
     targetBlockRow,
     targetBlockCol,
-    blockId: blockAt(input.overworldMap, input.stride, targetBlockRow, targetBlockCol),
-    inBounds
+    blockId,
+    inBounds,
+    semantic: classifyMapBlock(blockId)
   };
 }
 
@@ -262,6 +283,8 @@ export class PokemonStateReader {
     const currentBlockRow = Math.floor(y / 2) + MAP_BORDER;
     const currentBlockCol = Math.floor(x / 2) + MAP_BORDER;
     const visibleBlocks = readVisibleBlocks(overworldMap, currentViewPointer, stride);
+    const semanticVisibleBlocks = readVisibleBlockObservations(overworldMap, currentViewPointer, stride);
+    const currentBlockId = blockAt(overworldMap, stride, currentBlockRow, currentBlockCol);
 
     return {
       mapId,
@@ -272,8 +295,10 @@ export class PokemonStateReader {
       currentViewPointer,
       currentBlockRow,
       currentBlockCol,
-      currentBlockId: blockAt(overworldMap, stride, currentBlockRow, currentBlockCol),
+      currentBlockId,
+      currentBlockSemantic: classifyMapBlock(currentBlockId),
       visibleBlocks,
+      semanticVisibleBlocks,
       directionCandidates: buildDirectionCandidates({ overworldMap, stride, width, height, y, x })
     };
   }
