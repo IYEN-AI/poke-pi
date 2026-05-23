@@ -42,6 +42,20 @@ mgba --script .local-tools/mgba-http/mGBASocketServer.lua /absolute/path/to/lega
 
 Keep mGBA-http running separately. Download `mGBA-http` and `mGBASocketServer.lua` from the official mGBA-http release, or use the workspace-local `.local-tools/mgba-http/` install if it exists on your machine.
 
+If using the workspace-local install, start mGBA-http from the repo with:
+
+```bash
+npm run mgba:http
+```
+
+For detached background use:
+
+```bash
+npm run mgba:http:bg
+```
+
+These scripts run from `.local-tools/mgba-http` so its `appsettings.json` is loaded and `MGBA_HTTP_BASE_URL=http://127.0.0.1:51739` points at the correct bridge. The bundled config expects the mGBA Lua socket on `127.0.0.1:8889`; keep that port aligned with the port shown by mGBA's scripting socket.
+
 ## Environment
 
 Common settings:
@@ -207,6 +221,21 @@ Use this when you want the agent side to keep polling, running policies, and upd
 
 ```bash
 npm run poke -- strategy-bg --iterations 12 --max-steps 80 --llm-every 4 --run-id-prefix bg-strategy
+```
+
+Shortcut npm scripts are available for this loop:
+
+```bash
+npm run actor-critic:forever
+npm run actor-critic -- --iterations 4 --max-steps 60 --poll-ms 1000
+npm run actor-critic:bg -- --iterations 12 --max-steps 80 --llm-every 4 --run-id-prefix bg-strategy
+npm run actor-critic:monitor -- --iterations 3600 --poll-ms 1000
+```
+
+`actor-critic:forever` starts the movement monitor and then keeps the strategy loop running with large defaults. Override defaults with environment variables when needed:
+
+```bash
+MAX_STEPS=200 LLM_EVERY=6 RUN_ID_PREFIX=route1 npm run actor-critic:forever
 ```
 
 The detached process writes logs under `runs/.strategy/`. Its policy-selection strategy is:
