@@ -36,9 +36,7 @@ export class GeneratedHeuristicPolicy implements Policy {
         continue;
       }
 
-      const action = rule.preferMapDirection === true
-        ? chooseMapDirectionAction(state, input.recentActions ?? [], this.definition.tuning)
-        : rule.action;
+      const action = chooseRuleAction(rule, state, input.recentActions ?? [], this.definition.tuning, sameCoordRepeats);
       if (action === undefined) {
         continue;
       }
@@ -69,6 +67,24 @@ export class GeneratedHeuristicPolicy implements Policy {
   }
 }
 
+function chooseRuleAction(
+  rule: GeneratedPolicyRule,
+  state: PokemonStateSnapshot,
+  recentActions: readonly unknown[],
+  tuning: GeneratedPolicyDefinition["tuning"],
+  sameCoordRepeats: number
+): HarnessAction | undefined {
+  if (rule.explorationStrategy === "bold-route-probe") {
+    return chooseBoldRouteProbeAction(state, recentActions, tuning, sameCoordRepeats);
+  }
+
+  if (rule.preferMapDirection === true || rule.explorationStrategy === "greedy-map-direction") {
+    return chooseMapDirectionAction(state, recentActions, tuning);
+  }
+
+  return rule.action;
+}
+
 function matchesRule(rule: GeneratedPolicyRule, state: PokemonStateSnapshot, sameCoordRepeats: number): boolean {
   const condition = rule.when;
   if (condition.battle !== undefined && isBattle(state) !== condition.battle) return false;
@@ -81,6 +97,54 @@ function matchesRule(rule: GeneratedPolicyRule, state: PokemonStateSnapshot, sam
   if (condition.sameCoordRepeatsGte !== undefined && sameCoordRepeats < condition.sameCoordRepeatsGte) return false;
   if (condition.facingInteractionCandidate !== undefined && hasFacingInteractionCandidate(state) !== condition.facingInteractionCandidate) return false;
   return true;
+}
+
+function chooseBoldRouteProbeAction(
+  state: PokemonStateSnapshot,
+  recentActions: readonly unknown[],
+  tuning: GeneratedPolicyDefinition["tuning"],
+  sameCoordRepeats: number
+): HarnessAction | undefined {
+  const mapStructure = state.mapStructure;
+  if (mapStructure === undefined) {
+    return undefined;
+  }
+
+  const recentButtons = recentDirectionalButtons(recentActions, 6);
+  const boldCandidate = mapStructure.directionCandidates
+    .filter((candidate) => candidate.inBounds)
+    .map((candidate) => ({ candidate, score: scoreBoldCandidate(candidate, mapStructure, recentButtons, sameCoordRepeats) }))
+    .sort((left, right) => right.score - left.score || directionPriority(left.candidate.direction) - directionPriority(right.candidate.direction))[0];
+
+  if (boldCandidate === undefined || boldCandidate.score < 0) {
+    return chooseMapDirectionAction(state, recentActions, tuning);
+  }
+
+  const button = directionToButton(boldCandidate.candidate.direction);
+  const turnFirst = normalizeFacingDirection(state.playerFacingDirection) !== boldCandidate.candidate.direction;
+  const holdFrames = Math.min(60, DEFAULT_HOLD_FRAMES + Math.max(0, sameCoordRepeats - tuning.boldProbeAfterRepeats) * 4);
+  const actions: HarnessAction[] = turnFirst
+    ? [{ type: "press", button, frames: 4 }, { type: "hold", button, frames: holdFrames }]
+    : [{ type: "hold", button, frames: holdFrames }];
+
+  return { type: "sequence", actions };
+}
+
+function scoreBoldCandidate(
+  candidate: PokemonMapDirectionCandidate,
+  mapStructure: PokemonMapStructure,
+  recentButtons: ReadonlySet<MgbaButton>,
+  sameCoordRepeats: number
+): number {
+  let score = candidate.inBounds ? 8 : -20;
+  if (candidate.blockId !== undefined && candidate.blockId !== mapStructure.currentBlockId) score += 6;
+  if (candidate.semantic?.kind === "warp") score += 7;
+  if (candidate.semantic?.kind === "path" || candidate.semantic?.kind === "grass") score += 3;
+  if (candidate.semantic?.walkability === "likely_walkable") score += 2;
+  if (candidate.semantic?.interactionCandidate) score += sameCoordRepeats >= 5 ? 1 : -4;
+  if (candidate.semantic?.walkability === "likely_blocked") score -= sameCoordRepeats >= 5 ? 2 : 9;
+  if (recentButtons.has(directionToButton(candidate.direction))) score -= 16;
+  return score;
 }
 
 function chooseMapDirectionAction(
@@ -115,6 +179,11 @@ function scoreCandidate(
   let score = candidate.inBounds ? 10 : -10;
   if (candidate.blockId !== undefined) score += 2;
   if (preferDifferentBlock && candidate.blockId !== mapStructure.currentBlockId) score += 3;
+  if (candidate.semantic?.walkability === "likely_walkable") score += 3;
+  if (candidate.semantic?.kind === "path" || candidate.semantic?.kind === "grass") score += 1;
+  if (candidate.semantic?.kind === "warp") score += 2;
+  if (candidate.semantic?.walkability === "likely_blocked") score -= 8;
+  if (candidate.semantic?.interactionCandidate) score -= 2;
   if (recentButtons.has(directionToButton(candidate.direction))) score -= 12;
   return score;
 }
@@ -127,7 +196,7 @@ function hasFacingInteractionCandidate(state: PokemonStateSnapshot): boolean {
   }
 
   const candidate = mapStructure.directionCandidates.find((entry) => entry.direction === facing);
-  return candidate !== undefined && candidate.inBounds && candidate.blockId !== undefined;
+  return candidate?.inBounds === true && candidate?.blockId !== undefined;
 }
 
 function toStateSnapshot(input: PolicyInput): PokemonStateSnapshot {

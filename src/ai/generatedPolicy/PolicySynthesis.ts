@@ -24,6 +24,7 @@ export async function synthesizeGeneratedPolicy(options: SynthesizeGeneratedPoli
   const telemetry = events.filter((event) => objectField(event, "type") === "pokemon_telemetry").map((event) => objectField(event, "payload"));
   const routes = topStrings(telemetry.map((entry) => stringField(entry, "route")));
   const repeatedSignals = telemetry.filter((entry) => arrayField(entry, "improvementSignals").some((signal) => typeof signal === "string" && signal.includes("repeated"))).length;
+  const boldProbeAfterRepeats = repeatedSignals > 1 ? 2 : 3;
   const policy = GeneratedPolicySchema.parse({
     schema: "pokemon-generated-policy.v1",
     id: options.policyId,
@@ -35,7 +36,8 @@ export async function synthesizeGeneratedPolicy(options: SynthesizeGeneratedPoli
       avoidRecentDirections: true,
       preferDifferentBlock: true,
       interactionCandidatePatience: repeatedSignals > 0 ? 2 : 3,
-      fallbackToBaseHeuristic: true
+      fallbackToBaseHeuristic: true,
+      boldProbeAfterRepeats
     },
     rules: [
       {
@@ -59,6 +61,13 @@ export async function synthesizeGeneratedPolicy(options: SynthesizeGeneratedPoli
         action: { type: "press", button: "A", frames: 5 },
         confidence: 0.64
       },
+      ...(repeatedSignals > 0 ? [{
+        id: "critic-bold-route-probe",
+        description: "Critic observed repeated-state stagnation, so try a longer route-changing probe instead of the normal greedy direction.",
+        when: { textActive: false, sameCoordRepeatsGte: boldProbeAfterRepeats },
+        explorationStrategy: "bold-route-probe" as const,
+        confidence: 0.56
+      }] : []),
       ...routes.slice(0, 4).map((route) => ({
         id: `explore-${route.replace(/[^A-Za-z0-9_-]/g, "-")}`,
         description: `Explore ${route} with map RAM direction candidates from scout telemetry.`,
@@ -77,6 +86,7 @@ export async function synthesizeGeneratedPolicy(options: SynthesizeGeneratedPoli
     notes: [
       `Synthesized from ${events.length} events and ${telemetry.length} telemetry entries.`,
       routes.length > 0 ? `Observed routes: ${routes.join(", ")}.` : "No route telemetry was found; generic map exploration rule is used.",
+      repeatedSignals > 0 ? `Critic found ${repeatedSignals} repeated-state signals; bold route probes are enabled after ${boldProbeAfterRepeats} repeats.` : "Critic did not find repeated-state stagnation; normal map exploration remains primary.",
       "Generated policies are JSON DSL artifacts; harness schema validation rejects unsafe or malformed actions."
     ]
   });

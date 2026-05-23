@@ -17,7 +17,8 @@ const generatedPolicy: GeneratedPolicyDefinition = {
     avoidRecentDirections: true,
     preferDifferentBlock: true,
     interactionCandidatePatience: 2,
-    fallbackToBaseHeuristic: true
+    fallbackToBaseHeuristic: true,
+    boldProbeAfterRepeats: 3
   },
   rules: [
     {
@@ -114,6 +115,35 @@ describe("GeneratedHeuristicPolicy", () => {
     expect(decision.action.type).toBe("hold");
   });
 
+
+  it("uses critic bold-route probes to try larger policy shifts after repeated stalls", async () => {
+    const policy = new GeneratedHeuristicPolicy({
+      ...generatedPolicy,
+      rules: [{
+        id: "critic-bold-route-probe",
+        description: "Probe a route-changing direction after critic stagnation.",
+        when: { sameCoordRepeatsGte: 3, textActive: false },
+        explorationStrategy: "bold-route-probe",
+        confidence: 0.56
+      }, ...generatedPolicy.rules]
+    });
+
+    const decision = await policy.chooseAction({
+      state: { ...baseState, playerFacingDirection: "up" },
+      recentStates: [baseState, baseState, baseState],
+      recentActions: [
+        { action: { type: "hold", button: "Up", frames: 18 } },
+        { action: { type: "hold", button: "Left", frames: 18 } }
+      ]
+    });
+
+    expect(decision.action).toEqual({
+      type: "sequence",
+      actions: [{ type: "press", button: "Right", frames: 4 }, { type: "hold", button: "Right", frames: 18 }]
+    });
+    expect(decision.rationale).toContain("critic-bold-route-probe");
+  });
+
   it("still advances visible generated text states", async () => {
     const policy = new GeneratedHeuristicPolicy({
       ...generatedPolicy,
@@ -143,7 +173,7 @@ describe("GeneratedHeuristicPolicy", () => {
     await writeFile(path.join(runDir, "events.jsonl"), [
       JSON.stringify({ type: "pokemon_telemetry", payload: { route: "pallet_town", improvementSignals: ["repeated_state_tail"] } }),
       JSON.stringify({ type: "pokemon_telemetry", payload: { route: "pallet_town", improvementSignals: [] } })
-    ].join("\n") + "\n", "utf8");
+    ].join(`\n`) + `\n`, "utf8");
 
     const outputFile = path.join(dir, "policy.json");
     const result = await synthesizeGeneratedPolicy({ evidenceDir: dir, fromRun: "scout-one", policyId: "pallet-v1", outputFile, now: () => new Date("2026-05-23T00:00:00.000Z") });
@@ -152,7 +182,9 @@ describe("GeneratedHeuristicPolicy", () => {
 
     expect(result.telemetryEvents).toBe(2);
     expect(saved.id).toBe("pallet-v1");
+    expect(saved.rules.some((rule) => rule.id === "critic-bold-route-probe")).toBe(true);
     expect(saved.rules.some((rule) => rule.id === "explore-pallet_town")).toBe(true);
+    expect(saved.tuning.boldProbeAfterRepeats).toBe(3);
     expect(loaded.getDefinition().sourceRunId).toBe("scout-one");
   });
 });
