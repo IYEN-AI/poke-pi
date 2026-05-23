@@ -370,6 +370,40 @@ describe("HeuristicPolicy", () => {
     expect(palletDecision.rationale).toContain("Pallet Town");
   });
 
+  it("routes post-starter Pallet Town around the lab fence instead of backing out of stale text", async () => {
+    const policy = new HeuristicPolicy();
+    const belowFence = {
+      ...palletTownState,
+      wPartyCount: 1,
+      wYCoord: 12,
+      wXCoord: 10,
+      playerFacingDirection: "down",
+      screenText: "",
+      screenTextKind: "none"
+    };
+    const fenceGap = { ...belowFence, wXCoord: 5 };
+    const secondFence = { ...belowFence, wYCoord: 10, wXCoord: 5 };
+    const leftGap = { ...belowFence, wYCoord: 10, wXCoord: 2 };
+    const aboveFence = { ...belowFence, wYCoord: 7, wXCoord: 5 };
+
+    const belowFenceDecision = await policy.chooseAction({
+      state: belowFence,
+      recentStates: [belowFence, belowFence, belowFence]
+    });
+    const gapDecision = await policy.chooseAction({ state: fenceGap });
+    const secondFenceDecision = await policy.chooseAction({ state: secondFence });
+    const leftGapDecision = await policy.chooseAction({ state: leftGap });
+    const aboveFenceDecision = await policy.chooseAction({ state: aboveFence });
+
+    expect(belowFenceDecision.action).toEqual({ type: "hold", button: "Left", frames: 18 });
+    expect(gapDecision.action).toEqual({ type: "hold", button: "Up", frames: 18 });
+    expect(secondFenceDecision.action).toEqual({ type: "hold", button: "Left", frames: 18 });
+    expect(leftGapDecision.action).toEqual({ type: "hold", button: "Up", frames: 18 });
+    expect(aboveFenceDecision.action).toEqual({ type: "hold", button: "Right", frames: 18 });
+    expect(belowFenceDecision.action).not.toEqual({ type: "press", button: "B", frames: 5 });
+    expect(belowFenceDecision.rationale).toContain("Route 1");
+  });
+
   it("routes up from the observed Red house 2F x5 blocker", async () => {
     const policy = new HeuristicPolicy();
     const liveBlockedState = {
@@ -501,6 +535,31 @@ describe("HeuristicPolicy", () => {
     expect(decision.rationale).toContain("stair warp");
   });
 
+  it("treats empty Route 1 text flags as stale overworld instead of backing out", async () => {
+    const policy = new HeuristicPolicy();
+    const routeOneState: PokemonStateSnapshot = {
+      ...baseState,
+      wCurMap: 12,
+      wYCoord: 35,
+      wXCoord: 10,
+      wTextBoxID: 1,
+      screenText: "",
+      screenTextKind: "none"
+    };
+
+    const decision = await policy.chooseAction({
+      state: routeOneState,
+      recentStates: [routeOneState, routeOneState, routeOneState]
+    });
+
+    expect(decision.action.type).toBe("press");
+    if (decision.action.type !== "press") {
+      throw new Error("expected press action");
+    }
+    expect(["Up", "Right", "Down", "Left"]).toContain(decision.action.button);
+    expect(decision.action).not.toEqual({ type: "press", button: "B", frames: 5 });
+  });
+
   it("keeps repeated initialized overworld coordinates on exploratory directions", async () => {
     const policy = new HeuristicPolicy();
     const decision = await policy.chooseAction({
@@ -577,6 +636,63 @@ describe("HeuristicPolicy", () => {
     expect(decision.observedStateCitations).toContain(
       "mapStructure=8x8;currentBlock=0x22;candidates=up:in:0x22,right:in:0x22,down:in:0x22,left:in:0x31"
     );
+  });
+
+  it("does not keep pushing a recently failed map direction into a wall", async () => {
+    const policy = new HeuristicPolicy();
+    const mapAwareState: PokemonStateSnapshot = {
+      ...baseState,
+      wCurMap: 2,
+      wYCoord: 4,
+      wXCoord: 4,
+      mapStructure: {
+        mapId: 2,
+        width: 8,
+        height: 8,
+        stride: 14,
+        tileset: 1,
+        currentViewPointer: 0xc5d0,
+        currentBlockRow: 5,
+        currentBlockCol: 5,
+        currentBlockId: 0x22,
+        visibleBlocks: [[0x22]],
+        directionCandidates: [
+          { direction: "up", targetY: 3, targetX: 4, targetBlockRow: 4, targetBlockCol: 5, blockId: 0x22, inBounds: true },
+          { direction: "right", targetY: 4, targetX: 5, targetBlockRow: 5, targetBlockCol: 5, blockId: 0x22, inBounds: false },
+          { direction: "down", targetY: 5, targetX: 4, targetBlockRow: 5, targetBlockCol: 5, blockId: 0x22, inBounds: false },
+          { direction: "left", targetY: 4, targetX: 3, targetBlockRow: 5, targetBlockCol: 4, blockId: 0x22, inBounds: false }
+        ]
+      }
+    };
+
+    const decision = await policy.chooseAction({
+      state: mapAwareState,
+      recentStates: [mapAwareState, mapAwareState, mapAwareState],
+      recentActions: [
+        { action: { type: "hold", button: "Up", frames: 18 } },
+        { action: { type: "hold", button: "Up", frames: 18 } },
+        { action: { type: "hold", button: "Up", frames: 18 } }
+      ]
+    });
+
+    expect(decision.action).toEqual({ type: "hold", button: "Right", frames: 18 });
+    expect(decision.rationale).toContain("instead of continuing to push into the same wall");
+  });
+
+  it("avoids recently failed generic exploratory directions when no map structure is available", async () => {
+    const policy = new HeuristicPolicy();
+    const decision = await policy.chooseAction({
+      state: baseState,
+      recentStates: [baseState, baseState, baseState],
+      recentActions: [
+        { action: { type: "press", button: "Right", frames: 5 } },
+        { action: { type: "press", button: "Right", frames: 5 } },
+        { action: { type: "press", button: "Right", frames: 5 } }
+      ]
+    });
+
+    expect(decision.action).not.toEqual({ type: "press", button: "Right", frames: 5 });
+    expect(decision.rationale).toContain("avoiding recent wall-collision directions");
   });
 
 

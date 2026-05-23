@@ -13,6 +13,7 @@ const PLAYER_FACING_RIGHT = 0x0c;
 
 const EXPLORATORY_BUTTONS = ["Up", "Right", "Down", "Left"] as const;
 const MAP_AWARE_REPEATED_STATE_THRESHOLD = 1;
+const WALL_COLLISION_REPEATED_STATE_THRESHOLD = 2;
 const INTERACTION_REPEATED_STATE_THRESHOLD = 2;
 const MAP_INTERACTION_BLOCK_IDS = new Set([0x03, 0x04, 0x05, 0x06, 0x07, 0x0c, 0x0d, 0x15, 0x16, 0x17, 0x1c, 0x1d, 0x1e, 0x1f, 0x2c, 0x2d, 0x2e]);
 
@@ -92,6 +93,16 @@ export class HeuristicPolicy implements Policy {
       });
     }
 
+    const postStarterOverworldNavigation = choosePostStarterOverworldNavigationAction(state);
+    if (postStarterOverworldNavigation !== undefined) {
+      return validateDecision({
+        action: postStarterOverworldNavigation.action,
+        rationale: postStarterOverworldNavigation.rationale,
+        confidence: 0.66,
+        observedStateCitations: citations
+      });
+    }
+
     if (isTextOrMenuActive(state)) {
       const action = shouldBackOutOfRepeatedText(state, sameCoordRepeats) ? press("B") : press("A");
       return validateDecision({
@@ -126,10 +137,10 @@ export class HeuristicPolicy implements Policy {
     }
 
     if (sameCoordRepeats >= REPEATED_STATE_THRESHOLD) {
-      const button = chooseExploratoryButton(state, sameCoordRepeats);
+      const button = chooseExploratoryButton(state, sameCoordRepeats, input.recentActions ?? []);
       return validateDecision({
         action: press(button),
-        rationale: "Overworld coordinates have repeated, so choose a local exploratory direction from the current state hash.",
+        rationale: "Overworld coordinates have repeated, so choose a local exploratory direction from the current state hash while avoiding recent wall-collision directions.",
         confidence: 0.56,
         observedStateCitations: citations
       });
@@ -322,6 +333,12 @@ function isInBattle(state: PokemonStateSnapshot): boolean {
 
 function isTextOrMenuActive(state: PokemonStateSnapshot): boolean {
   const textBoxId = state.wTextBoxID ?? state.textBoxId ?? 0;
+  const screenText = typeof state.screenText === "string" ? state.screenText.trim() : undefined;
+  const screenTextKind = typeof state.screenTextKind === "string" ? state.screenTextKind : undefined;
+
+  if (textBoxId !== 0 && screenText === "" && screenTextKind === "none" && state.wCurMap !== 40) {
+    return state.menuActive === true || state.textActive === true;
+  }
 
   return state.menuActive === true || state.textActive === true || textBoxId !== 0;
 }
@@ -390,6 +407,69 @@ function chooseHomeNavigationAction(
   }
 
   return undefined;
+}
+
+function choosePostStarterOverworldNavigationAction(
+  state: PokemonStateSnapshot
+): Pick<PolicyDecision, "action" | "rationale"> | undefined {
+  if (getPartyCount(state) === 0) {
+    return undefined;
+  }
+
+  const mapId = state.wCurMap;
+  const y = state.wYCoord;
+  const x = state.wXCoord;
+  const screenText = typeof state.screenText === "string" ? state.screenText.trim() : "";
+  if (mapId !== 0 || y === undefined || x === undefined || screenText.length > 0) {
+    return undefined;
+  }
+
+  const button = choosePalletTownRoute1Step(y, x);
+  return {
+    action: hold(button),
+    rationale:
+      "Player has a starter and is in Pallet Town with no visible text, so treat empty text RAM flags as stale and route around the lab fence toward Route 1."
+  };
+}
+
+function choosePalletTownRoute1Step(y: number, x: number): MgbaButton {
+  if (y >= 12) {
+    if (x > 5) {
+      return "Left";
+    }
+
+    if (x < 5) {
+      return "Right";
+    }
+
+    return "Up";
+  }
+
+  if (y >= 10) {
+    if (x > 2) {
+      return "Left";
+    }
+
+    if (x < 2) {
+      return "Right";
+    }
+
+    return "Up";
+  }
+
+  if (y > 7) {
+    return "Up";
+  }
+
+  if (x < 10) {
+    return "Right";
+  }
+
+  if (x > 10) {
+    return "Left";
+  }
+
+  return "Up";
 }
 
 function isFreshRedHouseText(
@@ -549,8 +629,30 @@ function chooseMapAwareExplorationAction(
     return undefined;
   }
 
-  const recentlyFailedButtons = recentDirectionalButtons(recentActions, Math.min(sameCoordRepeats, 4));
-  const scoredCandidates = candidates
+  const recentlyFailedButtons = sameCoordRepeats >= WALL_COLLISION_REPEATED_STATE_THRESHOLD
+    ? recentDirectionalButtons(recentActions, Math.min(sameCoordRepeats + 2, 8))
+    : new Set<MgbaButton>();
+  const unblockedCandidates = candidates.filter((candidate) => !recentlyFailedButtons.has(directionToButton(candidate.direction)));
+  if (unblockedCandidates.length === 0 && recentlyFailedButtons.size > 0) {
+    const probeButton = EXPLORATORY_BUTTONS.find((button) => !recentlyFailedButtons.has(button));
+    if (probeButton !== undefined) {
+      return {
+        action: hold(probeButton),
+        rationale:
+          `Map RAM candidates were recently tried without coordinate movement (${[...recentlyFailedButtons].join(", ")}), ` +
+          `so probe ${probeButton} instead of continuing to push into the same wall.`
+      };
+    }
+
+    return {
+      action: { type: "wait", frames: DEFAULT_WAIT_FRAMES },
+      rationale:
+        `Map RAM has in-bounds candidates, but all candidate directions were recently tried without coordinate movement ` +
+        `(${[...recentlyFailedButtons].join(", ")}), so wait instead of continuing to push into the same wall.`
+    };
+  }
+
+  const scoredCandidates = (unblockedCandidates.length > 0 ? unblockedCandidates : candidates)
     .map((candidate) => ({ candidate, score: scoreMapCandidate(candidate, mapStructure, recentlyFailedButtons) }))
     .sort((left, right) => right.score - left.score || directionPriority(left.candidate.direction) - directionPriority(right.candidate.direction));
   const best = scoredCandidates[0];
@@ -583,7 +685,7 @@ function scoreMapCandidate(
     score += 2;
   }
   if (recentlyFailedButtons.has(directionToButton(candidate.direction))) {
-    score -= 12;
+    score -= 100;
   }
   return score;
 }
@@ -715,14 +817,20 @@ function countSameCoordinateRepeats(state: PokemonStateSnapshot, recentStates: r
 
 function chooseExploratoryButton(
   state: PokemonStateSnapshot,
-  sameCoordRepeats: number
+  sameCoordRepeats: number,
+  recentActions: readonly unknown[] = []
 ): (typeof EXPLORATORY_BUTTONS)[number] {
+  const recentlyFailedButtons = sameCoordRepeats >= WALL_COLLISION_REPEATED_STATE_THRESHOLD
+    ? recentDirectionalButtons(recentActions, Math.min(sameCoordRepeats + 2, 8))
+    : new Set<MgbaButton>();
+  const availableButtons = EXPLORATORY_BUTTONS.filter((button) => !recentlyFailedButtons.has(button));
+  const buttons = availableButtons.length > 0 ? availableButtons : EXPLORATORY_BUTTONS;
   const hash = [state.wCurMap ?? 0, state.wYCoord ?? 0, state.wXCoord ?? 0, sameCoordRepeats].reduce(
     (total, value) => total * 31 + value,
     7
   );
 
-  return EXPLORATORY_BUTTONS[Math.abs(hash) % EXPLORATORY_BUTTONS.length];
+  return buttons[Math.abs(hash) % buttons.length];
 }
 
 function buildObservedStateCitations(
