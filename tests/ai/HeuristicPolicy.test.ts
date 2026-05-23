@@ -592,8 +592,36 @@ describe("HeuristicPolicy", () => {
 
     const decision = await policy.chooseAction({ state: routeOneState });
 
-    expect(decision.action).toEqual({ type: "hold", button: "Left", frames: 18 });
+    expect(decision.action).toEqual({ type: "hold", button: "Up", frames: 18 });
     expect(decision.rationale).toContain("Route 1");
+  });
+
+  it("does not undo a Route 1 lateral sidestep immediately", async () => {
+    const policy = new HeuristicPolicy();
+    const routeOneCenter: PokemonStateSnapshot = {
+      ...baseState,
+      wCurMap: 12,
+      wYCoord: 24,
+      wXCoord: 10,
+      wTextBoxID: 1,
+      wLetterPrintingDelayFlags: 1,
+      screenText: "",
+      screenTextKind: "none"
+    };
+    const routeOneSidestep: PokemonStateSnapshot = { ...routeOneCenter, wXCoord: 11 };
+
+    const sidestep = await policy.chooseAction({
+      state: routeOneCenter,
+      recentStates: [routeOneCenter, routeOneCenter],
+      recentActions: [{ type: "hold", button: "Up", frames: 18 }]
+    });
+    const continueForward = await policy.chooseAction({
+      state: routeOneSidestep,
+      recentActions: [{ type: "hold", button: "Up", frames: 18 }, { type: "hold", button: "Right", frames: 18 }]
+    });
+
+    expect(sidestep.action).toEqual({ type: "hold", button: "Right", frames: 18 });
+    expect(continueForward.action).toEqual({ type: "hold", button: "Up", frames: 18 });
   });
 
   it("runs from low-HP wild battles when the battle menu is visible", async () => {
@@ -677,7 +705,7 @@ describe("HeuristicPolicy", () => {
     expect(decision.action).toEqual({ type: "hold", button: "Left", frames: 18 });
     expect(decision.rationale).toContain("Map RAM shows 8x8 block map");
     expect(decision.observedStateCitations).toContain(
-      "mapStructure=8x8;currentBlock=0x22;candidates=up:in:0x22,right:in:0x22,down:in:0x22,left:in:0x31"
+      "mapStructure=8x8;currentBlock=0x22;candidates=up:in:0x22:unknown/unknown,right:in:0x22:unknown/unknown,down:in:0x22:unknown/unknown,left:in:0x31:unknown/unknown"
     );
   });
 

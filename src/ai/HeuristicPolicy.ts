@@ -3,6 +3,7 @@ import type { HarnessAction, HoldAction, PolicyDecision, PressAction } from "../
 import type { MgbaButton } from "../mgba/MgbaTypes.js";
 import { mapKnowledgeFromRecent } from "../pokemon/MapKnowledge.js";
 import type { MapKnowledgeSummary } from "../pokemon/MapKnowledge.js";
+import { MAP_INTERACTION_BLOCK_IDS } from "../pokemon/MapSemantics.js";
 import type { PlayerFacingDirection, PokemonMapDirectionCandidate, PokemonMapStructure } from "../pokemon/PokemonTypes.js";
 import type { Policy, PolicyInput, PokemonStateSnapshot, RecentStateSnapshot } from "./Policy.js";
 
@@ -17,7 +18,6 @@ const EXPLORATORY_BUTTONS = ["Up", "Right", "Down", "Left"] as const;
 const MAP_AWARE_REPEATED_STATE_THRESHOLD = 1;
 const WALL_COLLISION_REPEATED_STATE_THRESHOLD = 2;
 const INTERACTION_REPEATED_STATE_THRESHOLD = 2;
-const MAP_INTERACTION_BLOCK_IDS = new Set([0x03, 0x04, 0x05, 0x06, 0x07, 0x0c, 0x0d, 0x15, 0x16, 0x17, 0x1c, 0x1d, 0x1e, 0x1f, 0x2c, 0x2d, 0x2e]);
 
 export class HeuristicPolicy implements Policy {
   async chooseAction(input: PolicyInput): Promise<PolicyDecision> {
@@ -477,10 +477,20 @@ function choosePostStarterRouteOneNavigationAction(
 
 function chooseRouteOneStep(y: number, x: number, sameCoordRepeats: number, recentActions: readonly unknown[]): MgbaButton {
   const recentButtons = recentDirectionalButtons(recentActions, 4);
-  if (x > 10) return "Left";
+  const lastButton = lastDirectionalButton(recentActions);
+
   if (x < 10) return "Right";
+  if (x > 11) return "Left";
+
+  if (x === 11) {
+    if (sameCoordRepeats >= WALL_COLLISION_REPEATED_STATE_THRESHOLD && recentButtons.has("Up")) {
+      return "Right";
+    }
+    return "Up";
+  }
+
   if (sameCoordRepeats >= WALL_COLLISION_REPEATED_STATE_THRESHOLD && recentButtons.has("Up")) {
-    return y % 2 === 0 ? "Right" : "Left";
+    return lastButton === "Right" ? "Up" : "Right";
   }
   return "Up";
 }
@@ -741,11 +751,13 @@ function chooseMapAwareExplorationAction(
   }
 
   const button = directionToButton(best.candidate.direction);
+  const semanticKind = best.candidate.semantic?.kind ?? "unknown";
+  const walkability = best.candidate.semantic?.walkability ?? "unknown";
   return {
     action: hold(button),
     rationale:
       `Map RAM shows ${mapStructure.width}x${mapStructure.height} block map with current block ${formatBlockId(mapStructure.currentBlockId)}; ` +
-      `choose ${button} toward block ${formatBlockId(best.candidate.blockId)} at ${best.candidate.targetY},${best.candidate.targetX} while avoiding recent/learned blocked directions; ` +
+      `choose ${button} toward ${semanticKind}/${walkability} block ${formatBlockId(best.candidate.blockId)} at ${best.candidate.targetY},${best.candidate.targetX} while avoiding recent/learned blocked directions; ` +
       `learned map has ${mapKnowledge?.totals.visitedTiles ?? 0} visited tiles, ${mapKnowledge?.totals.frontierTiles ?? 0} frontier tiles, and ${mapKnowledge?.totals.blockedEdges ?? 0} blocked edges.`
   };
 }
@@ -765,6 +777,21 @@ function scoreMapCandidate(
   }
   if (candidate.blockId !== mapStructure.currentBlockId) {
     score += 2;
+  }
+  if (candidate.semantic?.walkability === "likely_walkable") {
+    score += 3;
+  }
+  if (candidate.semantic?.kind === "grass" || candidate.semantic?.kind === "path") {
+    score += 1;
+  }
+  if (candidate.semantic?.kind === "warp") {
+    score += 2;
+  }
+  if (candidate.semantic?.walkability === "likely_blocked") {
+    score -= 8;
+  }
+  if (candidate.semantic?.interactionCandidate) {
+    score -= 2;
   }
   if (recentlyFailedButtons.has(directionToButton(candidate.direction))) {
     score -= 100;
@@ -798,6 +825,14 @@ function learnedCandidateStatus(
   }
   if (mapKnowledge.localFrontierTiles.some((tile) => `${tile.mapId}:${tile.y}:${tile.x}` === targetKey)) return "frontier";
   return mapKnowledge.localEdges.some((edge) => edge.to === targetKey && edge.status === "walkable") ? "visited" : undefined;
+}
+
+function lastDirectionalButton(recentActions: readonly unknown[]): MgbaButton | undefined {
+  for (let index = recentActions.length - 1; index >= 0; index -= 1) {
+    const button = extractDirectionalButton(recentActions[index]);
+    if (button !== undefined) return button;
+  }
+  return undefined;
 }
 
 function recentDirectionalButtons(recentActions: readonly unknown[], limit: number): ReadonlySet<MgbaButton> {
@@ -973,7 +1008,7 @@ function mapStructureCitation(mapStructure: PokemonMapStructure | undefined): st
   }
 
   const candidates = mapStructure.directionCandidates
-    .map((candidate) => `${candidate.direction}:${candidate.inBounds ? "in" : "out"}:${formatBlockId(candidate.blockId)}`)
+    .map((candidate) => `${candidate.direction}:${candidate.inBounds ? "in" : "out"}:${formatBlockId(candidate.blockId)}:${candidate.semantic?.kind ?? "unknown"}/${candidate.semantic?.walkability ?? "unknown"}`)
     .join(",");
   return `mapStructure=${mapStructure.width}x${mapStructure.height};currentBlock=${formatBlockId(mapStructure.currentBlockId)};candidates=${candidates}`;
 }
