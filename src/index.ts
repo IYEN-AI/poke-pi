@@ -6,6 +6,8 @@ import { promisify } from "node:util";
 import { pathToFileURL } from "node:url";
 import { inspect } from "node:util";
 import { HeuristicPolicy } from "./ai/HeuristicPolicy.js";
+import { GeneratedHeuristicPolicy } from "./ai/generatedPolicy/GeneratedHeuristicPolicy.js";
+import { synthesizeGeneratedPolicy } from "./ai/generatedPolicy/PolicySynthesis.js";
 import { LLMPolicy } from "./ai/LLMPolicy.js";
 import { Controller } from "./control/Controller.js";
 import type { MgbaButton } from "./mgba/MgbaTypes.js";
@@ -24,7 +26,7 @@ import { FullGameDetector } from "./pokemon/FullGameDetector.js";
 import { Stage1Detector } from "./pokemon/Stage1Detector.js";
 import { startDashboard, type DashboardHandle } from "./dashboardServer.js";
 
-type HarnessCommand = "snapshot" | "preflight" | "run" | "press" | "smoke" | "dashboard" | "map-heuristic" | "status" | "play" | "llm" | "ui" | "doctor" | "stop" | "clean-failed";
+type HarnessCommand = "snapshot" | "preflight" | "run" | "press" | "smoke" | "dashboard" | "map-heuristic" | "scout" | "synthesize-policy" | "play-policy" | "status" | "play" | "llm" | "ui" | "doctor" | "stop" | "clean-failed";
 
 export interface CliOptions {
   readonly command?: HarnessCommand;
@@ -39,6 +41,10 @@ export interface CliOptions {
   readonly dashboardPort?: number;
   readonly withDashboard: boolean;
   readonly yes: boolean;
+  readonly fromRun?: string;
+  readonly policyId?: string;
+  readonly policyFile?: string;
+  readonly objective?: string;
 }
 
 export interface CliIo {
@@ -48,7 +54,7 @@ export interface CliIo {
 
 export interface CliFactories {
   readonly loadConfig?: (env: NodeJS.ProcessEnv) => HarnessConfig;
-  readonly createRunner?: (config: HarnessConfig, options: RunnerCommandOptions) => CliRunner;
+  readonly createRunner?: (config: HarnessConfig, options: RunnerCommandOptions) => CliRunner | Promise<CliRunner>;
   readonly runPreflight?: (config: HarnessConfig) => Promise<MgbaPreflightReport>;
   readonly executePress?: (config: HarnessConfig, action: unknown) => Promise<void>;
   readonly startDashboard?: (config: HarnessConfig, port?: number) => Promise<DashboardHandle>;
@@ -62,6 +68,7 @@ export interface CliRunner {
 
 interface RunnerCommandOptions {
   readonly maxSteps?: number;
+  readonly policyFile?: string;
 }
 
 interface ParsedOptionResult {
@@ -87,6 +94,9 @@ export function getHarnessHelp(): string {
     "  npm run harness -- run [--policy heuristic|openai] [--mode stage1|full-game] [--max-steps N] [--run-id ID]",
     "  npm run poke -- status",
     "  npm run poke -- play [--max-steps N] [--run-id ID] [--port N]",
+    "  npm run poke -- scout [--max-steps N] [--run-id ID] [--port N]",
+    "  npm run poke -- synthesize-policy --from-run RUN --policy-id ID [--objective TEXT]",
+    "  npm run poke -- play-policy --policy-file policies/generated/ID.json [--max-steps N] [--run-id ID]",
     "  npm run poke -- llm [--max-steps N] [--run-id ID] [--port N]",
     "  npm run poke -- ui [--port N]",
     "  npm run poke -- stop",
@@ -101,6 +111,9 @@ export function getHarnessHelp(): string {
     "  preflight  Run mGBA preflight against the manually started service and loaded ROM state.",
     "  run        Start the selected harness loop. Defaults to Stage 1.",
     "  map-heuristic  Run map-aware heuristic exploration; optionally starts the dashboard for the run.",
+    "  scout      Alias for play: collect cheap heuristic map/state/action evidence.",
+    "  synthesize-policy  Create a validated JSON heuristic policy from a scout run.",
+    "  play-policy  Execute a generated JSON heuristic policy artifact.",
     "  status     Print redacted config and mGBA preflight status.",
     "  play       Start map-aware heuristic Stage 1 with dashboard enabled by default.",
     "  llm        Start OpenAI-compatible Stage 1 with dashboard enabled by default.",
@@ -155,6 +168,18 @@ export function parseCliArgs(args: readonly string[]): ParsedOptionResult {
       case "--yes":
       case "-y":
         options.yes = true;
+        break;
+      case "--from-run":
+        options.fromRun = parseNonEmpty(args[++index], "--from-run", errors);
+        break;
+      case "--policy-id":
+        options.policyId = parseNonEmpty(args[++index], "--policy-id", errors);
+        break;
+      case "--policy-file":
+        options.policyFile = parseNonEmpty(args[++index], "--policy-file", errors);
+        break;
+      case "--objective":
+        options.objective = parseNonEmpty(args[++index], "--objective", errors);
         break;
       default:
         if (arg?.startsWith("--") === true) {
@@ -215,6 +240,12 @@ export async function runCli(
         return await handleRun(parsed.options, io, factories);
       case "map-heuristic":
         return await handleMapHeuristic(parsed.options, io, factories);
+      case "scout":
+        return await handleScout(parsed.options, io, factories);
+      case "synthesize-policy":
+        return await handleSynthesizePolicy(parsed.options, io, factories);
+      case "play-policy":
+        return await handlePlayPolicy(parsed.options, io, factories);
       case "play":
         return await handlePlay(parsed.options, io, factories);
       case "llm":
@@ -273,7 +304,7 @@ async function handleSnapshot(options: CliOptions, io: CliIo, factories: CliFact
     return 0;
   }
 
-  const runner = (factories.createRunner ?? createRunner)(config, { maxSteps: options.maxSteps });
+  const runner = await (factories.createRunner ?? createRunner)(config, { maxSteps: options.maxSteps, policyFile: options.policyFile });
   const snapshot = await runner.snapshot();
   io.stdout(redactSecrets({ command: "snapshot", snapshot }));
   return 0;
@@ -297,9 +328,9 @@ async function handleStatus(options: CliOptions, io: CliIo, factories: CliFactor
 
 async function handleRun(options: CliOptions, io: CliIo, factories: CliFactories): Promise<number> {
   const config = loadCommandConfig(options, factories);
-  const runner = (factories.createRunner ?? createRunner)(config, { maxSteps: options.maxSteps });
+  const runner = await (factories.createRunner ?? createRunner)(config, { maxSteps: options.maxSteps, policyFile: options.policyFile });
   const result = await runner.run();
-  io.stdout(redactSecrets({ command: "run", result }));
+  io.stdout(redactSecrets({ command: "run", policyFile: options.policyFile, result }));
   return result.status === "completed" ? 0 : 1;
 }
 
@@ -320,13 +351,53 @@ async function handleMapHeuristic(options: CliOptions, io: CliIo, factories: Cli
   }
 
   try {
-    const runner = (factories.createRunner ?? createRunner)(config, { maxSteps: options.maxSteps });
+    const runner = await (factories.createRunner ?? createRunner)(config, { maxSteps: options.maxSteps, policyFile: options.policyFile });
     const result = await runner.run();
     io.stdout(redactSecrets({ command: "map-heuristic", dashboardUrl: dashboard?.url, result }));
     return result.status === "completed" ? 0 : 1;
   } finally {
     await dashboard?.close();
   }
+}
+
+async function handleScout(options: CliOptions, io: CliIo, factories: CliFactories): Promise<number> {
+  return handlePlay({ ...options, runId: options.runId ?? `scout-${Date.now()}` }, io, factories);
+}
+
+async function handleSynthesizePolicy(options: CliOptions, io: CliIo, factories: CliFactories): Promise<number> {
+  const config = loadCommandConfig(options, factories, true);
+  if (options.fromRun === undefined || options.policyId === undefined) {
+    io.stderr("synthesize-policy requires --from-run RUN and --policy-id ID.");
+    return 1;
+  }
+
+  const result = await synthesizeGeneratedPolicy({
+    evidenceDir: config.evidenceDir,
+    fromRun: options.fromRun,
+    policyId: options.policyId,
+    objective: options.objective,
+    outputFile: options.policyFile
+  });
+  io.stdout(redactSecrets({ command: "synthesize-policy", result }));
+  return 0;
+}
+
+async function handlePlayPolicy(options: CliOptions, io: CliIo, factories: CliFactories): Promise<number> {
+  if (options.policyFile === undefined) {
+    io.stderr("play-policy requires --policy-file policies/generated/<id>.json.");
+    return 1;
+  }
+
+  const config = loadCommandConfig({
+    ...options,
+    policy: "heuristic",
+    mode: options.mode ?? "stage1",
+    runId: options.runId ?? `policy-${Date.now()}`
+  }, factories);
+  const runner = await (factories.createRunner ?? createRunner)(config, { maxSteps: options.maxSteps, policyFile: options.policyFile });
+  const result = await runner.run();
+  io.stdout(redactSecrets({ command: "play-policy", policyFile: options.policyFile, result }));
+  return result.status === "completed" ? 0 : 1;
 }
 
 
@@ -513,9 +584,11 @@ function createSmokeDependencies(config: HarnessConfig): MgbaSmokeWorkflowDepend
   };
 }
 
-function createRunner(config: HarnessConfig, options: RunnerCommandOptions): CliRunner {
+async function createRunner(config: HarnessConfig, options: RunnerCommandOptions): Promise<CliRunner> {
   const client = new MgbaHttpClient({ baseUrl: config.mgbaHttpBaseUrl });
-  const heuristicPolicy = new HeuristicPolicy();
+  const heuristicPolicy = options.policyFile !== undefined
+    ? await GeneratedHeuristicPolicy.fromFile(options.policyFile)
+    : new HeuristicPolicy();
   const policy = isLlmProvider(config.aiProvider)
     ? LLMPolicy.fromConfig(config, heuristicPolicy)
     : heuristicPolicy;
@@ -743,7 +816,7 @@ function parseNonEmpty(value: string | undefined, name: string, errors: string[]
 }
 
 function isHarnessCommand(value: string): value is HarnessCommand {
-  return value === "snapshot" || value === "preflight" || value === "run" || value === "press" || value === "smoke" || value === "dashboard" || value === "map-heuristic" || value === "status" || value === "play" || value === "llm" || value === "ui" || value === "doctor" || value === "stop" || value === "clean-failed";
+  return value === "snapshot" || value === "preflight" || value === "run" || value === "press" || value === "smoke" || value === "dashboard" || value === "map-heuristic" || value === "scout" || value === "synthesize-policy" || value === "play-policy" || value === "status" || value === "play" || value === "llm" || value === "ui" || value === "doctor" || value === "stop" || value === "clean-failed";
 }
 
 interface MutableCliOptions {
@@ -759,6 +832,10 @@ interface MutableCliOptions {
   dashboardPort?: number;
   withDashboard: boolean;
   yes: boolean;
+  fromRun?: string;
+  policyId?: string;
+  policyFile?: string;
+  objective?: string;
 }
 
 if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {

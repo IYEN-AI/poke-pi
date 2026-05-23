@@ -92,6 +92,53 @@ describe("dashboard server", () => {
     expect(spawned[0]?.env.AI_PROVIDER).toBe("heuristic");
   });
 
+  it("exposes Hermes-style agent endpoints for generated policy orchestration", async () => {
+    const evidenceDir = await mkdtemp(path.join(tmpdir(), "poke-pi-dashboard-agent-"));
+    const runDir = path.join(evidenceDir, "scout-one");
+    await mkdir(runDir, { recursive: true });
+    await writeFile(path.join(runDir, "summary.json"), JSON.stringify({ runId: "scout-one", status: "failed_timeout", counts: { decisions: 2 } }), "utf8");
+    await writeFile(path.join(runDir, "events.jsonl"), [
+      JSON.stringify({ type: "decision", payload: { decision: { confidence: 0.5 } } }),
+      JSON.stringify({ type: "pokemon_telemetry", payload: { route: "pallet_town", improvementSignals: ["repeated_state_tail"] } })
+    ].join("\n") + "\n", "utf8");
+    const spawned: Array<{ args: readonly string[] }> = [];
+    const handle = await startDashboard({
+      config: config(evidenceDir),
+      port: 0,
+      spawnHarness(args) {
+        const child = Object.assign(new EventEmitter(), {
+          pid: 4321,
+          kill(signal?: string) {
+            child.emit("exit", null, signal ?? "SIGTERM");
+            return true;
+          }
+        });
+        spawned.push({ args });
+        return child as never;
+      }
+    });
+    handles.push(handle);
+
+    const synthesizeResponse = await fetch(`${handle.url}/api/agent/synthesize-policy`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ fromRun: "scout-one", policyId: "pallet-web", policyFile: path.join(evidenceDir, "pallet-web.json") })
+    });
+    const runResponse = await fetch(`${handle.url}/api/agent/run`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ policy: "generated", policyFile: path.join(evidenceDir, "pallet-web.json"), runId: "generated-one", maxSteps: 9 })
+    });
+    const evaluateResponse = await fetch(`${handle.url}/api/agent/evaluate/scout-one`);
+
+    expect(synthesizeResponse.status).toBe(200);
+    expect(await synthesizeResponse.json()).toMatchObject({ policy: { id: "pallet-web" } });
+    expect(runResponse.status).toBe(202);
+    expect(spawned[0]?.args).toContain("--policy-file");
+    expect(spawned[0]?.args).toContain(path.join(evidenceDir, "pallet-web.json"));
+    expect(await evaluateResponse.json()).toMatchObject({ schema: "pokemon-agent-run-evaluation.v1", recommendation: "synthesize_or_tune_policy_to_avoid_loops" });
+  });
+
   it("renders dashboard controls for HTTP run management and map telemetry", async () => {
     const evidenceDir = await mkdtemp(path.join(tmpdir(), "poke-pi-dashboard-ui-"));
     const handle = await startDashboard({ config: config(evidenceDir), port: 0 });
@@ -108,6 +155,8 @@ describe("dashboard server", () => {
     expect(html).toContain("controlStart('play')");
     expect(html).not.toContain("Manual input");
     expect(html).not.toContain("controlPress");
+    expect(html).toContain("Agent orchestration");
+    expect(html).toContain("/api/agent/observation");
     expect(html).toContain("Map structure");
     expect(html).toContain("directionCandidates");
   });

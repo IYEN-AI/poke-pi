@@ -104,6 +104,9 @@ npm run poke -- stop
 | --- | --- | --- |
 | `npm run poke -- status` | Prints redacted config and runs mGBA preflight. | First check when anything looks stuck. |
 | `npm run poke -- play --max-steps 100 --run-id map-1` | Runs Stage 1 with the map-aware heuristic policy and starts the dashboard. | Default autonomous map exploration. |
+| `npm run poke -- scout --max-steps 300 --run-id scout-1` | Alias for `play` that names the intent: cheap map/state/action evidence collection. | Feed Hermes/policy synthesis. |
+| `npm run poke -- synthesize-policy --from-run scout-1 --policy-id pallet-v1` | Creates `policies/generated/pallet-v1.json`, a schema-validated heuristic policy DSL artifact. | Let Hermes turn scout logs into a new executable heuristic. |
+| `npm run poke -- play-policy --policy-file policies/generated/pallet-v1.json --run-id exec-1` | Executes a generated JSON heuristic policy through the normal harness runner. | Validate synthesized policies before using expensive LLM execution. |
 | `npm run poke -- llm --max-steps 100 --run-id llm-1` | Runs Stage 1 through the configured OpenAI-compatible provider and starts the dashboard. | Compare LLM decisions against heuristic behavior. |
 | `npm run poke -- ui --port 3030` | Starts only the web dashboard/control server. | Watch screen/RAM/telemetry, start heuristic or LLM agent runs, and stop the active run. |
 | `npm run poke -- press A --frames 5` | Sends one safe manual button input. | Smoke checks or unblocking a prompt manually. |
@@ -119,6 +122,10 @@ npm run poke -- stop
 --max-steps N       Number of decision/action steps before the run stops.
 --run-id ID         Evidence directory name under runs/. Use a new ID per run.
 --port N            Dashboard port for play, llm, or ui. Defaults to 3030.
+--from-run ID       Scout/evidence run to synthesize from.
+--policy-id ID      Generated policy artifact id.
+--policy-file FILE  Generated policy JSON path.
+--objective TEXT    Optional policy synthesis objective.
 --yes               Required for destructive cleanup commands.
 ```
 
@@ -136,6 +143,19 @@ The dashboard on `:3030` is also the harness control server. `poke` commands and
 | `POST /api/control/clean-failed` | Delete non-completed run directories from `runs/`. |
 
 `mGBA-http` remains the low-level emulator bridge. The dashboard/control server is the higher-level run manager that knows about run IDs, policies, evidence, and active child harness processes.
+
+### Hermes / generated-policy API
+
+Hermes-style agents should not send Game Boy button input directly. They should observe, synthesize/tune policy artifacts, and ask the harness to run those policies:
+
+| Endpoint | Meaning |
+| --- | --- |
+| `GET /api/agent/observation` | Machine-readable current control status plus live RAM/screen-derived state. |
+| `GET /api/agent/evaluate/:runId` | Condensed run evaluation with recent improvement signals and a recommended next adjustment. |
+| `POST /api/agent/synthesize-policy` | Create a generated policy JSON artifact from a scout run. Body: `fromRun`, `policyId`, optional `objective`, optional `policyFile`. |
+| `POST /api/agent/run` | Start a heuristic, LLM, or generated-policy run. Body accepts `policy`, `policyFile`, `maxSteps`, `runId`, and `mode`. |
+
+Generated policies use a constrained JSON DSL (`pokemon-generated-policy.v1`) rather than arbitrary TypeScript. That gives Hermes room to create new heuristics while the harness still validates every action through the normal action schema.
 
 ### What `play` does internally
 
@@ -156,6 +176,19 @@ npm run harness -- map-heuristic --with-dashboard --mode stage1 --max-steps 100 
 ```
 
 The map-aware heuristic reads Red/Blue WRAM map structure (`wOverworldMap`, current map width/height, current block coordinates, and neighboring direction candidates). It explores with directional inputs first and only presses `A` in normal overworld movement when the tile/block in front is treated as an interaction candidate. Text boxes, menus, and battles still use prompt/battle-specific controls.
+
+### Scout → synthesize → execute loop
+
+Use this when you want “cheap heuristic information gathering → Hermes-generated heuristic → expensive LLM/hybrid execution”:
+
+```bash
+npm run poke -- scout --max-steps 300 --run-id scout-1
+npm run poke -- synthesize-policy --from-run scout-1 --policy-id pallet-v1
+npm run poke -- play-policy --policy-file policies/generated/pallet-v1.json --max-steps 200 --run-id exec-1
+npm run poke -- llm --max-steps 100 --run-id llm-guided-1
+```
+
+The generated policy phase is intentionally separate from the LLM phase. Scout runs collect map/action/outcome telemetry cheaply; Hermes can synthesize a JSON policy from those logs; the harness validates and executes that policy; then the LLM can be reserved for higher-cost planning or unresolved states.
 
 ### What stays outside the wrapper
 

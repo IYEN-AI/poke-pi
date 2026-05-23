@@ -19,6 +19,8 @@ describe("CLI", () => {
     expect(io.out.join("\n")).toContain("play");
     expect(io.out.join("\n")).toContain("status");
     expect(io.out.join("\n")).toContain("clean-failed");
+    expect(io.out.join("\n")).toContain("synthesize-policy");
+    expect(io.out.join("\n")).toContain("play-policy");
     expect(io.out.join("\n")).toContain("heuristic|openai");
     expect(io.out.join("\n")).toContain("stage1|full-game");
   });
@@ -28,6 +30,8 @@ describe("CLI", () => {
     const dashboard = parseCliArgs(["dashboard", "--port", "4040"]);
     const mapHeuristic = parseCliArgs(["map-heuristic", "--max-steps", "12", "--run-id", "map-cli", "--with-dashboard", "--port", "3031"]);
     const play = parseCliArgs(["play", "--max-steps", "5", "--run-id", "easy", "--port", "3032"]);
+    const synthesize = parseCliArgs(["synthesize-policy", "--from-run", "scout-1", "--policy-id", "pallet-v1", "--objective", "find starter"]);
+    const playPolicy = parseCliArgs(["play-policy", "--policy-file", "policies/generated/pallet-v1.json", "--max-steps", "11"]);
     const cleanFailed = parseCliArgs(["clean-failed", "--yes"]);
 
     expect(parsed.errors).toEqual([]);
@@ -38,6 +42,10 @@ describe("CLI", () => {
     expect(mapHeuristic.options).toMatchObject({ command: "map-heuristic", maxSteps: 12, runId: "map-cli", withDashboard: true, dashboardPort: 3031 });
     expect(play.errors).toEqual([]);
     expect(play.options).toMatchObject({ command: "play", maxSteps: 5, runId: "easy", dashboardPort: 3032 });
+    expect(synthesize.errors).toEqual([]);
+    expect(synthesize.options).toMatchObject({ command: "synthesize-policy", fromRun: "scout-1", policyId: "pallet-v1", objective: "find starter" });
+    expect(playPolicy.errors).toEqual([]);
+    expect(playPolicy.options).toMatchObject({ command: "play-policy", policyFile: "policies/generated/pallet-v1.json", maxSteps: 11 });
     expect(cleanFailed.errors).toEqual([]);
     expect(cleanFailed.options).toMatchObject({ command: "clean-failed", yes: true });
   });
@@ -295,11 +303,17 @@ describe("CLI", () => {
     const actions: unknown[] = [];
 
     const okExit = await runCli(["press", "A", "--frames", "3"], io, {
+      async controlRequest() {
+        throw new Error("no control server in unit test");
+      },
       async executePress(_config, action) {
         actions.push(action);
       }
     });
     const badExit = await runCli(["press", "L", "--frames", "3"], createIo(), {
+      async controlRequest() {
+        throw new Error("no control server in unit test");
+      },
       async executePress(_config, action) {
         actions.push(action);
       }

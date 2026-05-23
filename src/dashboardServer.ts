@@ -9,6 +9,7 @@ import type { AiProvider, HarnessConfig, HarnessMode } from "./config.js";
 import { redactSecrets } from "./evidence/EvidenceRecorder.js";
 import { MgbaHttpClient } from "./mgba/MgbaHttpClient.js";
 import { PokemonStateReader } from "./pokemon/PokemonStateReader.js";
+import { synthesizeGeneratedPolicy } from "./ai/generatedPolicy/PolicySynthesis.js";
 
 export type DashboardSpawnHarness = (args: readonly string[], env: NodeJS.ProcessEnv) => ChildProcess;
 
@@ -77,6 +78,11 @@ async function routeRequest(input: {
       return;
     }
 
+    if (url.pathname.startsWith("/api/agent")) {
+      await routeAgentRequest({ request, response, url, config, client, stateReader, control });
+      return;
+    }
+
     if (request.method !== "GET") {
       sendJson(response, 405, { error: "method_not_allowed" });
       return;
@@ -135,13 +141,14 @@ interface DashboardControlOptions {
   readonly spawnHarness?: DashboardSpawnHarness;
 }
 
-type ControlRunKind = "play" | "llm";
+type ControlRunKind = "play" | "llm" | "policy";
 
 interface ControlRunOptions {
   readonly kind: ControlRunKind;
   readonly maxSteps?: number;
   readonly runId?: string;
   readonly mode?: HarnessMode;
+  readonly policyFile?: string;
 }
 
 class DashboardControl {
@@ -184,13 +191,17 @@ class DashboardControl {
     if (options.maxSteps !== undefined) {
       args.push("--max-steps", String(options.maxSteps));
     }
+    if (options.policyFile !== undefined) {
+      args.push("--policy-file", options.policyFile);
+    }
 
     const env = {
       ...process.env,
       AI_PROVIDER: policy,
       HARNESS_MODE: options.mode ?? "stage1",
       HARNESS_RUN_ID: runId,
-      EVIDENCE_DIR: this.config.evidenceDir
+      EVIDENCE_DIR: this.config.evidenceDir,
+      GENERATED_POLICY_FILE: options.policyFile
     };
     const child = this.spawnHarness(args, env);
     this.child = child;
@@ -298,6 +309,78 @@ async function routeControlRequest(input: {
 
   if (url.pathname === "/api/control/clean-failed") {
     sendJson(response, 200, await control.cleanFailed());
+    return;
+  }
+
+  sendJson(response, 404, { error: "not_found" });
+}
+
+async function routeAgentRequest(input: {
+  request: IncomingMessage;
+  response: ServerResponse;
+  url: URL;
+  config: HarnessConfig;
+  client: MgbaHttpClient;
+  stateReader: PokemonStateReader;
+  control: DashboardControl;
+}): Promise<void> {
+  const { request, response, url, config, client, stateReader, control } = input;
+
+  if (request.method === "GET" && url.pathname === "/api/agent/observation") {
+    const live = await readLiveState(client, stateReader);
+    sendJson(response, 200, redactSecrets({ schema: "pokemon-agent-observation.v1", control: control.status(), live }));
+    return;
+  }
+
+  const evaluateMatch = /^\/api\/agent\/evaluate\/([^/]+)$/.exec(url.pathname);
+  if (request.method === "GET" && evaluateMatch !== null) {
+    sendJson(response, 200, summarizeRunForAgent(await readRun(config.evidenceDir, decodeURIComponent(evaluateMatch[1] ?? ""))));
+    return;
+  }
+
+  if (request.method !== "POST") {
+    sendJson(response, 405, { error: "method_not_allowed" });
+    return;
+  }
+
+  const body = await readJsonBody(request);
+  if (url.pathname === "/api/agent/run") {
+    const requestedPolicy = stringField(body, "policy");
+    const policyFile = stringField(body, "policyFile");
+    if (requestedPolicy !== undefined && !["heuristic", "openai", "generated"].includes(requestedPolicy)) {
+      sendJson(response, 400, { error: "unsupported_policy", allowed: ["heuristic", "openai", "generated"] });
+      return;
+    }
+    if (requestedPolicy === "generated" && policyFile === undefined) {
+      sendJson(response, 400, { error: "missing_policy_file" });
+      return;
+    }
+    const kind: ControlRunKind = requestedPolicy === "openai" ? "llm" : policyFile !== undefined || requestedPolicy === "generated" ? "policy" : "play";
+    const result = control.start({
+      kind,
+      maxSteps: positiveNumberField(body, "maxSteps"),
+      runId: stringField(body, "runId"),
+      mode: modeField(body),
+      policyFile
+    });
+    sendJson(response, objectField(result, "error") === undefined ? 202 : 409, result);
+    return;
+  }
+
+  if (url.pathname === "/api/agent/synthesize-policy") {
+    const fromRun = stringField(body, "fromRun");
+    const policyId = stringField(body, "policyId");
+    if (fromRun === undefined || policyId === undefined) {
+      sendJson(response, 400, { error: "missing_from_run_or_policy_id" });
+      return;
+    }
+    sendJson(response, 200, await synthesizeGeneratedPolicy({
+      evidenceDir: config.evidenceDir,
+      fromRun,
+      policyId,
+      objective: stringField(body, "objective"),
+      outputFile: stringField(body, "policyFile")
+    }));
     return;
   }
 
@@ -430,6 +513,51 @@ async function readRun(evidenceDir: string, runId: string): Promise<unknown> {
   const improvementLog = telemetry.map(toImprovementLogEntry).filter((entry) => entry !== undefined);
 
   return redactSecrets({ runId, config, summary, events, lastStateEvent, lastDecision, lastAction, telemetry, improvementLog });
+}
+
+function summarizeRunForAgent(run: unknown): unknown {
+  const summary = summaryObject(objectField(run, "summary"));
+  const improvementLog = Array.isArray(objectField(run, "improvementLog")) ? objectField(run, "improvementLog") as unknown[] : [];
+  const recentSignals = improvementLog
+    .slice(-20)
+    .flatMap((entry) => {
+      const signals = objectField(entry, "improvementSignals");
+      return Array.isArray(signals) ? signals : [];
+    })
+    .filter((signal): signal is string => typeof signal === "string");
+
+  return redactSecrets({
+    schema: "pokemon-agent-run-evaluation.v1",
+    runId: objectField(run, "runId"),
+    status: summary.status,
+    counts: summary.counts,
+    lastDecision: objectField(objectField(run, "lastDecision"), "payload") ?? objectField(run, "lastDecision"),
+    lastAction: objectField(objectField(run, "lastAction"), "payload") ?? objectField(run, "lastAction"),
+    recentSignals,
+    signalCounts: countStrings(recentSignals),
+    recommendation: recommendAgentAdjustment(summary.status, recentSignals)
+  });
+}
+
+function countStrings(values: readonly string[]): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const value of values) {
+    counts[value] = (counts[value] ?? 0) + 1;
+  }
+  return counts;
+}
+
+function recommendAgentAdjustment(status: unknown, signals: readonly string[]): string {
+  if (status === "completed") {
+    return "promote_or_reuse_policy";
+  }
+  if (signals.some((signal) => signal.includes("repeated"))) {
+    return "synthesize_or_tune_policy_to_avoid_loops";
+  }
+  if (signals.includes("low_confidence_decision") || signals.includes("llm_fallback_used")) {
+    return "collect_more_scout_data_or_raise_llm_budget";
+  }
+  return "continue_scouting_or_compare_generated_policy";
 }
 
 async function readJsonIfExists(file: string): Promise<unknown> {
@@ -587,6 +715,14 @@ function dashboardHtml(): string {
         </div>
         <div class="hud" id="controlSummary" style="grid-template-columns: repeat(2, minmax(0, 1fr)); margin-top: 10px;"></div>
         <pre id="controlResponse">ready</pre>
+      </section>
+      <section>
+        <h2>Agent orchestration</h2>
+        <p class="muted">Hermes should observe and launch policies here; it should not send direct gamepad input.</p>
+        <pre>GET /api/agent/observation
+GET /api/agent/evaluate/:runId
+POST /api/agent/synthesize-policy
+POST /api/agent/run</pre>
       </section>
       <section>
         <h2>Harness run</h2>
