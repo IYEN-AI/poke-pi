@@ -91,6 +91,50 @@ describe("GeneratedHeuristicPolicy", () => {
     expect(decision.rationale).toContain("map-explore");
   });
 
+  it("treats empty none-kind text flags as stale overworld for generated map exploration", async () => {
+    const policy = new GeneratedHeuristicPolicy(generatedPolicy);
+    const staleRouteState: PokemonStateSnapshot = {
+      ...baseState,
+      wCurMap: 12,
+      wYCoord: 24,
+      wXCoord: 10,
+      wTextBoxID: 1,
+      wLetterPrintingDelayFlags: 1,
+      screenText: "",
+      screenTextKind: "none",
+      playerFacingDirection: "up"
+    };
+
+    const decision = await policy.chooseAction({
+      state: staleRouteState,
+      recentStates: [staleRouteState]
+    });
+
+    expect(decision.rationale).toContain("map-explore");
+    expect(decision.action.type).toBe("hold");
+  });
+
+  it("still advances visible generated text states", async () => {
+    const policy = new GeneratedHeuristicPolicy({
+      ...generatedPolicy,
+      rules: [{
+        id: "text-advance",
+        description: "Advance text.",
+        when: { textActive: true },
+        action: { type: "press", button: "A", frames: 5 },
+        confidence: 0.7
+      }, ...generatedPolicy.rules]
+    });
+
+    const decision = await policy.chooseAction({
+      state: { ...baseState, wTextBoxID: 1, screenText: "Visible dialog", screenTextKind: "overworld_text" }
+    });
+
+    expect(decision.action).toEqual({ type: "press", button: "A", frames: 5 });
+    expect(decision.rationale).toContain("text-advance");
+  });
+
+
   it("loads policy files and synthesizes policy artifacts from scout telemetry", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "poke-generated-policy-"));
     const runDir = path.join(dir, "scout-one");

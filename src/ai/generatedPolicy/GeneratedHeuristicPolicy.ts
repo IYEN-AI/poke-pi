@@ -141,7 +141,16 @@ function isBattle(state: PokemonStateSnapshot): boolean {
 
 function isTextActive(state: PokemonStateSnapshot): boolean {
   const textBoxId = state.wTextBoxID ?? state.textBoxId ?? 0;
-  return state.menuActive === true || state.textActive === true || textBoxId !== 0 || (typeof state.screenText === "string" && state.screenText.trim().length > 0);
+  const screenText = typeof state.screenText === "string" ? state.screenText.trim() : "";
+  const screenTextKind = typeof state.screenTextKind === "string" ? state.screenTextKind : "none";
+
+  if (screenText.length > 0) return true;
+  if (screenTextKind === "oak_intro" || screenTextKind === "default_name_menu" || screenTextKind === "naming_screen" || screenTextKind === "overworld_text") return true;
+  if (textBoxId !== 0 && screenTextKind === "none" && screenText.length === 0) {
+    return state.menuActive === true || state.textActive === true;
+  }
+
+  return state.menuActive === true || state.textActive === true || textBoxId !== 0;
 }
 
 function countSameCoordinateRepeats(state: PokemonStateSnapshot, recentStates: readonly RecentStateSnapshot[]): number {
