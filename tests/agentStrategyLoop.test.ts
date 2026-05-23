@@ -44,6 +44,49 @@ describe("strategy loop", () => {
     expect(result.currentPolicyFile).toBe("policies/generated/unit-policy-3.json");
     expect(result.lastRunId).toBe("unit-strategy-llm-4");
   });
+
+  it("uses external blocked-movement feedback to trigger an LLM reroute and policy synthesis context", async () => {
+    const calls: Array<{ path: string; body: unknown; method?: string }> = [];
+    const request: StrategyLoopControlRequest = async (_baseUrl, path, body, method) => {
+      calls.push({ path, body, method });
+      if (path === "/api/control/status") return { status: 200, body: { running: false } };
+      if (path.startsWith("/api/agent/evaluate/")) return { status: 200, body: { recommendation: "synthesize_or_tune_policy_to_avoid_loops" } };
+      if (path === "/api/agent/synthesize-policy") return { status: 200, body: { outputFile: objectField(body, "policyFile") } };
+      if (path === "/api/agent/run") return { status: 202, body: { started: true } };
+      return { status: 404, body: { error: "unexpected" } };
+    };
+    let feedbackEnabled = false;
+
+    await runStrategyLoop({
+      baseUrl: "http://127.0.0.1:3030",
+      maxIterations: 3,
+      maxSteps: 5,
+      pollMs: 0,
+      llmEvery: 99,
+      runIdPrefix: "unit-feedback",
+      policyIdPrefix: "unit-feedback-policy",
+      request,
+      sleep: async () => undefined,
+      movementFeedback: async () => feedbackEnabled ? {
+        schema: "pokemon-movement-feedback.v1",
+        movementQuality: "blocked",
+        recommendation: "avoid_repeating_last_direction_and_request_visual_reroute",
+        counts: { no_change: 4 }
+      } : undefined,
+      log: (event) => {
+        if (event.type === "policy_synthesized") feedbackEnabled = true;
+      }
+    });
+
+    const runBodies = calls.filter((call) => call.path === "/api/agent/run").map((call) => call.body);
+    expect(runBodies).toMatchObject([
+      { policy: "heuristic", runId: "unit-feedback-scout-1" },
+      { policy: "openai", runId: "unit-feedback-llm-2" },
+      { policy: "openai", runId: "unit-feedback-llm-3" }
+    ]);
+    expect(calls.some((call) => call.path === "/api/agent/synthesize-policy")).toBe(true);
+  });
+
 });
 
 function objectField(value: unknown, field: string): unknown {

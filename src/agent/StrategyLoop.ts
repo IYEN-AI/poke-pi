@@ -22,6 +22,7 @@ export interface StrategyLoopOptions {
   readonly sleep?: (ms: number) => Promise<void>;
   readonly now?: () => Date;
   readonly request?: StrategyLoopControlRequest;
+  readonly movementFeedback?: () => Promise<unknown>;
   readonly log?: (event: StrategyLoopEvent) => void;
 }
 
@@ -51,7 +52,11 @@ export async function runStrategyLoop(options: StrategyLoopOptions): Promise<Str
 
   for (let iteration = 1; iteration <= options.maxIterations; iteration += 1) {
     await waitUntilIdle(options.baseUrl, request, sleep, options.pollMs);
-    const phase = choosePhase({ iteration, currentPolicyFile, llmEvery: options.llmEvery });
+    const latestMovementFeedback = await options.movementFeedback?.();
+    if (latestMovementFeedback !== undefined) {
+      options.log?.({ type: "movement_feedback_observed", iteration, detail: latestMovementFeedback });
+    }
+    const phase = choosePhase({ iteration, currentPolicyFile, llmEvery: options.llmEvery, movementFeedback: latestMovementFeedback });
     const runId = `${options.runIdPrefix}-${phase}-${iteration}`;
     const policyId = `${options.policyIdPrefix}-${iteration}`;
     const requestedPolicyFile = currentPolicyFile;
@@ -70,7 +75,7 @@ export async function runStrategyLoop(options: StrategyLoopOptions): Promise<Str
         fromRun: runId,
         policyId,
         policyFile,
-        objective: options.objective ?? strategyObjective(phase, evaluation.body)
+        objective: options.objective ?? strategyObjective(phase, evaluation.body, latestMovementFeedback)
       }, "POST");
       if (synthesis.status >= 400) {
         options.log?.({ type: "policy_synthesis_failed", iteration, runId, policyFile, detail: synthesis.body });
@@ -86,9 +91,13 @@ export async function runStrategyLoop(options: StrategyLoopOptions): Promise<Str
   return { iterations: options.maxIterations, currentPolicyFile, lastRunId };
 }
 
-function choosePhase(input: { readonly iteration: number; readonly currentPolicyFile?: string; readonly llmEvery: number }): Phase {
+function choosePhase(input: { readonly iteration: number; readonly currentPolicyFile?: string; readonly llmEvery: number; readonly movementFeedback?: unknown }): Phase {
   if (input.currentPolicyFile === undefined) {
     return "scout";
+  }
+
+  if (movementQuality(input.movementFeedback) === "blocked") {
+    return "llm";
   }
 
   if (input.llmEvery > 0 && input.iteration % input.llmEvery === 0) {
@@ -154,13 +163,24 @@ function shouldSynthesizePolicy(phase: Phase, evaluation: unknown): boolean {
   return recommendation !== "promote_or_reuse_policy";
 }
 
-function strategyObjective(phase: Phase, evaluation: unknown): string {
+function strategyObjective(phase: Phase, evaluation: unknown, movementFeedback?: unknown): string {
+  const movementLines = movementFeedback === undefined ? [] : [
+    `External movement monitor quality: ${String(objectField(movementFeedback, "movementQuality") ?? "unknown")}.`,
+    `External movement monitor recommendation: ${String(objectField(movementFeedback, "recommendation") ?? "unknown")}.`,
+    `External movement counts: ${JSON.stringify(objectField(movementFeedback, "counts") ?? {})}.`
+  ];
   return [
     "Continuously improve Pokemon Red/Blue controller policy from recent run telemetry.",
     `Last phase: ${phase}.`,
     `Evaluator recommendation: ${String(objectField(evaluation, "recommendation") ?? "unknown")}.`,
-    "Use heuristic policies for cheap map scouting and generated policy validation; reserve LLM runs for periodic higher-cost execution checks, repeated-loop recovery, or low-confidence strategic choices."
+    ...movementLines,
+    "Use heuristic policies for cheap map scouting and generated policy validation; reserve LLM runs for periodic higher-cost execution checks, repeated-loop recovery, blocked movement rerouting, or low-confidence strategic choices."
   ].join(" ");
+}
+
+function movementQuality(feedback: unknown): string | undefined {
+  const quality = objectField(feedback, "movementQuality");
+  return typeof quality === "string" ? quality : undefined;
 }
 
 async function defaultControlRequest(baseUrl: string, path: string, body: unknown, method: "GET" | "POST" = "POST"): Promise<StrategyLoopRequest> {

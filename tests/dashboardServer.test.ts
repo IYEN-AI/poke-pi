@@ -129,7 +129,10 @@ describe("dashboard server", () => {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ policy: "generated", policyFile: path.join(evidenceDir, "pallet-web.json"), runId: "generated-one", maxSteps: 9 })
     });
+    await mkdir(path.join(evidenceDir, ".movement-feedback"), { recursive: true });
+    await writeFile(path.join(evidenceDir, ".movement-feedback", "latest.json"), JSON.stringify({ schema: "pokemon-movement-feedback.v1", runId: "scout-one", movementQuality: "blocked", recommendation: "avoid_repeating_last_direction_and_request_visual_reroute", counts: { no_change: 3 }, recentExperiences: [] }), "utf8");
     const evaluateResponse = await fetch(`${handle.url}/api/agent/evaluate/scout-one`);
+    const movementFeedbackResponse = await fetch(`${handle.url}/api/agent/movement-feedback`);
 
     expect(synthesizeResponse.status).toBe(200);
     expect(await synthesizeResponse.json()).toMatchObject({ policy: { id: "pallet-web" } });
@@ -137,6 +140,7 @@ describe("dashboard server", () => {
     expect(spawned[0]?.args).toContain("--policy-file");
     expect(spawned[0]?.args).toContain(path.join(evidenceDir, "pallet-web.json"));
     expect(await evaluateResponse.json()).toMatchObject({ schema: "pokemon-agent-run-evaluation.v1", recommendation: "synthesize_or_tune_policy_to_avoid_loops" });
+    expect(await movementFeedbackResponse.json()).toMatchObject({ schema: "pokemon-movement-feedback.v1", runId: "scout-one", movementQuality: "blocked" });
   });
 
   it("renders dashboard controls for HTTP run management and map telemetry", async () => {
@@ -157,6 +161,8 @@ describe("dashboard server", () => {
     expect(html).not.toContain("controlPress");
     expect(html).toContain("Agent orchestration");
     expect(html).toContain("/api/agent/observation");
+    expect(html).toContain("/api/agent/movement-feedback");
+    expect(html).toContain("Movement monitor feedback");
     expect(html).toContain("Map structure");
     expect(html).toContain("directionCandidates");
   });

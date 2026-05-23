@@ -10,6 +10,7 @@ import { redactSecrets } from "./evidence/EvidenceRecorder.js";
 import { MgbaHttpClient } from "./mgba/MgbaHttpClient.js";
 import { PokemonStateReader } from "./pokemon/PokemonStateReader.js";
 import { synthesizeGeneratedPolicy } from "./ai/generatedPolicy/PolicySynthesis.js";
+import { readLatestMovementFeedback } from "./agent/MovementMonitor.js";
 
 export type DashboardSpawnHarness = (args: readonly string[], env: NodeJS.ProcessEnv) => ChildProcess;
 
@@ -333,6 +334,11 @@ async function routeAgentRequest(input: {
   if (request.method === "GET" && url.pathname === "/api/agent/observation") {
     const live = await readLiveState(client, stateReader);
     sendJson(response, 200, redactSecrets({ schema: "pokemon-agent-observation.v1", control: control.status(), live }));
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/agent/movement-feedback") {
+    sendJson(response, 200, await readLatestMovementFeedback(config.evidenceDir) ?? { schema: "pokemon-movement-feedback.v1", status: "missing" });
     return;
   }
 
@@ -737,6 +743,7 @@ function dashboardHtml(): string {
         <p class="muted">Hermes should observe and launch policies here; it should not send direct gamepad input.</p>
         <pre>GET /api/agent/observation
 GET /api/agent/evaluate/:runId
+GET /api/agent/movement-feedback
 POST /api/agent/synthesize-policy
 POST /api/agent/run</pre>
       </section>
@@ -750,6 +757,7 @@ POST /api/agent/run</pre>
       </section>
       <section><h3>Last LLM decision</h3><pre id="lastDecision">none</pre></section>
       <section><h3>Last button action</h3><pre id="lastAction">none</pre></section>
+      <section><h3>Movement monitor feedback</h3><div class="hud" id="movementFeedbackSummary" style="grid-template-columns: repeat(2, minmax(0, 1fr));"></div><pre id="movementFeedbackDetails">waiting for external monitor...</pre></section>
       <section><h3>Improvement log</h3><div class="events" id="improvementLog"></div></section>
       <section><h3>Map structure</h3><div class="hud" id="mapSummary" style="grid-template-columns: repeat(2, minmax(0, 1fr));"></div><pre id="mapCandidates">waiting for RAM...</pre></section>
       <section><h3>Live RAM snapshot</h3><pre id="liveState">loading...</pre></section>
@@ -872,6 +880,16 @@ async function refreshLive() {
   $('liveState').textContent = j(live.state);
   if (lastScreenOkAt) $('screenMeta').textContent = 'frame ' + live.frame + ' · screen ' + lastScreenOkAt.toLocaleTimeString() + ' · state ' + live.readAt;
 }
+async function refreshMovementFeedback() {
+  const feedback = await getJson('/api/agent/movement-feedback');
+  renderMetrics('movementFeedbackSummary', {
+    status: feedback.status ?? 'available',
+    run: feedback.runId ?? 'none',
+    quality: feedback.movementQuality ?? 'unknown',
+    recommendation: feedback.recommendation ?? 'none'
+  });
+  $('movementFeedbackDetails').textContent = j({ counts: feedback.counts, recentExperiences: feedback.recentExperiences });
+}
 async function refreshRuns() {
   const runs = await getJson('/api/runs');
   if (!selectedRun && runs[0]) selectedRun = runs[0].runId;
@@ -895,11 +913,12 @@ $('controlLlm').addEventListener('click', () => void controlStart('llm').catch(e
 $('controlStop').addEventListener('click', () => void controlStop().catch(e => { setStatus(String(e), false); $('controlResponse').textContent = String(e); }));
 $('controlCleanFailed').addEventListener('click', () => void controlCleanFailed().catch(e => { setStatus(String(e), false); $('controlResponse').textContent = String(e); }));
 (async function main() {
-  try { await refreshConfig(); await refreshControl(); await refreshRuns(); refreshScreen(); setStatus('connected to ' + config.mgbaHttpBaseUrl); }
+  try { await refreshConfig(); await refreshControl(); await refreshMovementFeedback(); await refreshRuns(); refreshScreen(); setStatus('connected to ' + config.mgbaHttpBaseUrl); }
   catch (e) { setStatus(String(e), false); }
   setInterval(refreshScreen, 1000);
   setInterval(() => refreshLive().then(() => setStatus('live')).catch(e => setStatus('RAM unavailable; screen may use latest frame', false)), 2500);
   setInterval(() => refreshControl().catch(e => setStatus(String(e), false)), 2000);
+  setInterval(() => refreshMovementFeedback().catch(e => setStatus(String(e), false)), 2000);
   setInterval(() => refreshRuns().catch(e => setStatus(String(e), false)), 3500);
 })();
 </script>

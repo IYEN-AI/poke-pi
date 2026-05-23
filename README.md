@@ -110,6 +110,8 @@ npm run poke -- stop
 | `npm run poke -- llm --max-steps 100 --run-id llm-1 --policy-file policies/generated/pallet-v1.json` | Runs Stage 1 through the configured OpenAI-compatible provider and optionally injects a generated policy as a guide. | Use LLM for higher-cost execution while respecting Hermes' synthesized heuristic recommendation. |
 | `npm run poke -- strategy-bg --iterations 12 --max-steps 80 --llm-every 4` | Starts a detached strategy loop that polls the control server, runs scout/generated/LLM phases, evaluates results, and updates generated policies. | Let the repo keep improving policies in the background. |
 | `npm run poke -- strategy-loop --iterations 4 --max-steps 60` | Same strategy loop in the foreground with event logs printed to stdout. | Debug the background strategist. |
+| `npm run poke -- movement-monitor-bg --iterations 3600 --poll-ms 1000` | Starts a detached external observer that watches active runs, classifies movement outcomes, and writes `runs/.movement-feedback/latest.json`. | Give the strategy loop/Hermes a second-loop critique of whether movement is actually progressing. |
+| `npm run poke -- movement-monitor --iterations 120 --poll-ms 1000` | Same movement monitor in the foreground with feedback events printed to stdout. | Debug blocked movement, wall pushes, and map transitions. |
 | `npm run poke -- ui --port 3030` | Starts only the web dashboard/control server. | Watch screen/RAM/telemetry, start heuristic or LLM agent runs, and stop the active run. |
 | `npm run poke -- press A --frames 5` | Sends one safe manual button input. | Smoke checks or unblocking a prompt manually. |
 | `npm run poke -- stop` | Stops repo-started Node harness/dashboard processes. Leaves mGBA and mGBA-http alone. | Cleanly stop automation without closing the emulator. |
@@ -135,6 +137,8 @@ npm run poke -- stop
 --yes               Required for destructive cleanup commands.
 ```
 
+Movement-monitor options use `--iterations`, `--poll-ms`, and `--port` too. The monitor is read-only: it watches the control server plus run evidence and never sends inputs.
+
 ### Control server HTTP API
 
 The dashboard on `:3030` is also the harness control server. `poke` commands and the web UI use these endpoints when possible:
@@ -158,6 +162,7 @@ Hermes-style agents should not send Game Boy button input directly. They should 
 | --- | --- |
 | `GET /api/agent/observation` | Machine-readable current control status plus live RAM/screen-derived state. |
 | `GET /api/agent/evaluate/:runId` | Condensed run evaluation with recent improvement signals and a recommended next adjustment. |
+| `GET /api/agent/movement-feedback` | Latest external movement monitor feedback, if `movement-monitor`/`movement-monitor-bg` is running. |
 | `POST /api/agent/synthesize-policy` | Create a generated policy JSON artifact from a scout run. Body: `fromRun`, `policyId`, optional `objective`, optional `policyFile`. |
 | `POST /api/agent/run` | Start a heuristic, LLM, or generated-policy run. Body accepts `policy`, `policyFile`, `maxSteps`, `runId`, and `mode`. |
 
@@ -213,6 +218,8 @@ The detached process writes logs under `runs/.strategy/`. Its policy-selection s
 5. Every `--llm-every N` iterations, run OpenAI-compatible LLM execution with the latest generated policy injected as a guide.
 6. Repeat until `--iterations` is exhausted.
 
+If `runs/.movement-feedback/latest.json` exists, the strategy loop also reads that external observer feedback before choosing the next phase. A `blocked` movement quality forces an LLM-guided reroute even when `--llm-every` would normally wait longer.
+
 Foreground debug mode:
 
 ```bash
@@ -220,6 +227,24 @@ npm run poke -- strategy-loop --iterations 4 --max-steps 60 --poll-ms 1000
 ```
 
 The strategy loop still never sends manual gamepad input. It only starts harness runs and updates policy files; actual button actions are produced by the selected policy inside the harness.
+
+### External movement feedback loop
+
+Run this alongside `strategy-bg` when you want a second loop watching whether selected policies are actually moving through the map:
+
+```bash
+npm run poke -- movement-monitor-bg --iterations 3600 --poll-ms 1000
+```
+
+The movement monitor polls `GET /api/control/status`, reads the active run's `events.jsonl`, extracts `pokemon-post-action-observation.v1` telemetry, and writes:
+
+```text
+runs/.movement-feedback/<runId>.json
+runs/.movement-feedback/latest.json
+```
+
+Feedback includes counts for `walk_step`, `no_change`, `blocked_with_visual_change`, `turn_only`, `map_transition`, `non_adjacent_position_jump`, and `visual_only_transition`; an overall `movementQuality` (`moving`, `blocked`, `transitioning`, `idle`, or `unknown`); and a recommended adjustment such as asking the LLM for a visual reroute. The dashboard exposes the same data at `GET /api/agent/movement-feedback` and renders it in the **Movement monitor feedback** panel.
+
 
 ### What stays outside the wrapper
 
@@ -264,7 +289,7 @@ The dashboard UI includes:
 - **Control server**: enter `runId`, `maxSteps`, and mode, then start `Play heuristic` or `LLM run`, stop the active child harness, or clean failed runs. The dashboard intentionally does not expose manual game input; gameplay is agent-only.
 - **mGBA screen**: live screenshot stream from mGBA-http, with latest evidence screenshot fallback when mGBA screenshot capture fails.
 - **Map structure**: current map dimensions, tileset, block row/column/id, direction candidates, and visible blocks read from Red/Blue WRAM.
-- **Harness telemetry**: recent run summary, last LLM decision, last button action, route context, map/x/y/facing, battle HP, screen text, selected action, confidence, checkpoint progress, repeated-state signals, fallback/low-confidence markers, learned map-knowledge totals, local blocked/walkable edges, recent map transitions, and current screenshot attachment for vision-capable LLMs, bounded macro-route sequences, and short-cycle post-action RAM/pixel-change probes with classified transition kinds for LLM map-identity judgment.
+- **Harness telemetry**: recent run summary, last LLM decision, last button action, external movement monitor feedback, route context, map/x/y/facing, battle HP, screen text, selected action, confidence, checkpoint progress, repeated-state signals, fallback/low-confidence markers, learned map-knowledge totals, local blocked/walkable edges, recent map transitions, and current screenshot attachment for vision-capable LLMs, bounded macro-route sequences, and short-cycle post-action RAM/pixel-change probes with classified transition kinds for LLM map-identity judgment.
 
 Start the Stage 1 harness loop with the local heuristic policy:
 

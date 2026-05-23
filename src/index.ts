@@ -26,8 +26,9 @@ import { FullGameDetector } from "./pokemon/FullGameDetector.js";
 import { Stage1Detector } from "./pokemon/Stage1Detector.js";
 import { startDashboard, type DashboardHandle } from "./dashboardServer.js";
 import { runStrategyLoop } from "./agent/StrategyLoop.js";
+import { readLatestMovementFeedback, runMovementMonitor } from "./agent/MovementMonitor.js";
 
-type HarnessCommand = "snapshot" | "preflight" | "run" | "press" | "smoke" | "dashboard" | "map-heuristic" | "scout" | "synthesize-policy" | "play-policy" | "strategy-loop" | "strategy-bg" | "status" | "play" | "llm" | "ui" | "doctor" | "stop" | "clean-failed";
+type HarnessCommand = "snapshot" | "preflight" | "run" | "press" | "smoke" | "dashboard" | "map-heuristic" | "scout" | "synthesize-policy" | "play-policy" | "strategy-loop" | "strategy-bg" | "movement-monitor" | "movement-monitor-bg" | "status" | "play" | "llm" | "ui" | "doctor" | "stop" | "clean-failed";
 
 export interface CliOptions {
   readonly command?: HarnessCommand;
@@ -105,6 +106,8 @@ export function getHarnessHelp(): string {
     "  npm run poke -- llm [--max-steps N] [--run-id ID] [--port N] [--policy-file policies/generated/ID.json]",
     "  npm run poke -- strategy-loop [--iterations N] [--max-steps N] [--llm-every N] [--poll-ms N] [--port N]",
     "  npm run poke -- strategy-bg [--iterations N] [--max-steps N] [--llm-every N] [--poll-ms N] [--port N]",
+    "  npm run poke -- movement-monitor [--iterations N] [--poll-ms N] [--port N]",
+    "  npm run poke -- movement-monitor-bg [--iterations N] [--poll-ms N] [--port N]",
     "  npm run poke -- ui [--port N]",
     "  npm run poke -- stop",
     "  npm run poke -- clean-failed --yes",
@@ -123,6 +126,8 @@ export function getHarnessHelp(): string {
     "  play-policy  Execute a generated JSON heuristic policy artifact.",
     "  strategy-loop  Poll in foreground and alternate scout/generated/LLM-guided policy runs.",
     "  strategy-bg  Start strategy-loop as a detached background process and write a log under runs/.strategy/.",
+    "  movement-monitor  Watch active runs and write movement feedback under runs/.movement-feedback/.",
+    "  movement-monitor-bg  Start movement-monitor as a detached background observer.",
     "  status     Print redacted config and mGBA preflight status.",
     "  play       Start map-aware heuristic Stage 1 with dashboard enabled by default.",
     "  llm        Start OpenAI-compatible Stage 1 with dashboard enabled by default; --policy-file supplies a generated-policy guide.",
@@ -271,6 +276,10 @@ export async function runCli(
         return await handleStrategyLoop(parsed.options, io, factories);
       case "strategy-bg":
         return await handleStrategyBackground(parsed.options, io, factories);
+      case "movement-monitor":
+        return await handleMovementMonitor(parsed.options, io, factories);
+      case "movement-monitor-bg":
+        return await handleMovementMonitorBackground(parsed.options, io, factories);
       case "play":
         return await handlePlay(parsed.options, io, factories);
       case "llm":
@@ -444,6 +453,7 @@ async function handleStrategyLoop(options: CliOptions, io: CliIo, factories: Cli
     policyIdPrefix: options.policyId ?? `strategy-policy-${startedAt}`,
     objective: options.objective,
     request: (baseUrl, pathName, body, method = "POST") => requestControl(baseUrl, pathName, body, factories, method),
+    movementFeedback: () => readLatestMovementFeedback(config.evidenceDir),
     log: (event) => io.stdout(redactSecrets({ command: "strategy-loop", event }))
   });
   io.stdout(redactSecrets({ command: "strategy-loop", dashboardUrl: control.url, result }));
@@ -496,6 +506,54 @@ async function handleStrategyBackground(options: CliOptions, io: CliIo, factorie
   return 0;
 }
 
+
+async function handleMovementMonitor(options: CliOptions, io: CliIo, factories: CliFactories): Promise<number> {
+  const config = loadCommandConfig(options, factories, true);
+  const baseUrl = controlBaseUrl(options.dashboardPort);
+  const result = await runMovementMonitor({
+    evidenceDir: config.evidenceDir,
+    baseUrl,
+    iterations: options.iterations ?? 120,
+    pollMs: options.pollMs ?? 1000,
+    request: factories.controlRequest === undefined ? undefined : (url, pathName) => factories.controlRequest!(url, pathName, undefined, "GET"),
+    log: (event) => io.stdout(redactSecrets({ command: "movement-monitor", event }))
+  });
+  io.stdout(redactSecrets({ command: "movement-monitor", dashboardUrl: baseUrl, result }));
+  return 0;
+}
+
+async function handleMovementMonitorBackground(options: CliOptions, io: CliIo, factories: CliFactories): Promise<number> {
+  if (factories.controlRequest !== undefined) {
+    return handleMovementMonitor(options, io, factories);
+  }
+
+  const config = loadCommandConfig(options, factories, true);
+  const logDir = path.join(config.evidenceDir, ".movement-monitor");
+  await mkdir(logDir, { recursive: true });
+  const startedAt = new Date().toISOString().replace(/[:.]/g, "-");
+  const logPath = path.join(logDir, `${options.runIdPrefix ?? "movement-monitor"}-${startedAt}.log`);
+  const logHandle = await open(logPath, "a");
+  const childArgs = [
+    "src/index.ts",
+    "movement-monitor",
+    "--iterations",
+    String(options.iterations ?? 3600),
+    "--poll-ms",
+    String(options.pollMs ?? 1000),
+    "--port",
+    String(options.dashboardPort ?? 3030)
+  ];
+  const child = spawn("./node_modules/.bin/tsx", childArgs, {
+    cwd: process.cwd(),
+    env: process.env,
+    detached: true,
+    stdio: ["ignore", logHandle.fd, logHandle.fd]
+  });
+  child.unref();
+  await logHandle.close();
+  io.stdout(redactSecrets({ command: "movement-monitor-bg", pid: child.pid, logPath, args: childArgs }));
+  return 0;
+}
 
 async function handlePlay(options: CliOptions, io: CliIo, factories: CliFactories): Promise<number> {
   return startControlledRun("play", options, io, factories);
@@ -915,7 +973,7 @@ function parseNonEmpty(value: string | undefined, name: string, errors: string[]
 }
 
 function isHarnessCommand(value: string): value is HarnessCommand {
-  return value === "snapshot" || value === "preflight" || value === "run" || value === "press" || value === "smoke" || value === "dashboard" || value === "map-heuristic" || value === "scout" || value === "synthesize-policy" || value === "play-policy" || value === "strategy-loop" || value === "strategy-bg" || value === "status" || value === "play" || value === "llm" || value === "ui" || value === "doctor" || value === "stop" || value === "clean-failed";
+  return value === "snapshot" || value === "preflight" || value === "run" || value === "press" || value === "smoke" || value === "dashboard" || value === "map-heuristic" || value === "scout" || value === "synthesize-policy" || value === "play-policy" || value === "strategy-loop" || value === "strategy-bg" || value === "movement-monitor" || value === "movement-monitor-bg" || value === "status" || value === "play" || value === "llm" || value === "ui" || value === "doctor" || value === "stop" || value === "clean-failed";
 }
 
 interface MutableCliOptions {
