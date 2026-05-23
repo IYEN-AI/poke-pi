@@ -1,16 +1,20 @@
+import type { ChildProcess } from "node:child_process";
+import { spawn } from "node:child_process";
 import { createReadStream } from "node:fs";
-import { spawn, type ChildProcess } from "node:child_process";
-import { mkdir, readdir, readFile, rm, stat } from "node:fs/promises";
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { appendFile, mkdir, readdir, readFile, rm, stat } from "node:fs/promises";
+import type { IncomingMessage, ServerResponse } from "node:http";
+import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { readLatestMovementFeedback } from "./agent/MovementMonitor.js";
+import { synthesizeGeneratedPolicy } from "./ai/generatedPolicy/PolicySynthesis.js";
 import type { AiProvider, HarnessConfig, HarnessMode } from "./config.js";
+import { evaluateAgentRun } from "./evaluation/RunEvaluation.js";
 import { redactSecrets } from "./evidence/EvidenceRecorder.js";
 import { MgbaHttpClient } from "./mgba/MgbaHttpClient.js";
 import { PokemonStateReader } from "./pokemon/PokemonStateReader.js";
-import { synthesizeGeneratedPolicy } from "./ai/generatedPolicy/PolicySynthesis.js";
-import { readLatestMovementFeedback } from "./agent/MovementMonitor.js";
+import { validateWorldKnowledgeUpdate } from "./pokemon/WorldKnowledgeUpdate.js";
 
 export type DashboardSpawnHarness = (args: readonly string[], env: NodeJS.ProcessEnv) => ChildProcess;
 
@@ -354,6 +358,16 @@ async function routeAgentRequest(input: {
   }
 
   const body = await readJsonBody(request);
+  if (url.pathname === "/api/agent/world-update") {
+    const update = validateWorldKnowledgeUpdate(body);
+    if (update === undefined) {
+      sendJson(response, 400, { error: "invalid_world_update", schema: "pokemon-world-update.v1" });
+      return;
+    }
+    sendJson(response, 200, await recordWorldKnowledgeUpdate(config.evidenceDir, update));
+    return;
+  }
+
   if (url.pathname === "/api/agent/run") {
     const requestedPolicy = stringField(body, "policy");
     const policyFile = stringField(body, "policyFile");
@@ -411,6 +425,15 @@ async function readJsonBody(request: IncomingMessage): Promise<unknown> {
   } catch {
     return {};
   }
+}
+
+async function recordWorldKnowledgeUpdate(evidenceDir: string, update: unknown): Promise<unknown> {
+  const now = new Date().toISOString();
+  const dir = path.join(evidenceDir, ".world-updates");
+  const event = redactSecrets({ type: "world_update", timestamp: now, payload: update });
+  await mkdir(dir, { recursive: true });
+  await appendFile(path.join(dir, "events.jsonl"), `${JSON.stringify(event)}\n`, "utf8");
+  return { schema: "pokemon-world-update-ack.v1", accepted: true, stored: path.join(dir, "events.jsonl") };
 }
 
 function positiveNumberField(value: unknown, key: string): number | undefined {
@@ -540,46 +563,14 @@ async function readRun(evidenceDir: string, runId: string): Promise<unknown> {
 function summarizeRunForAgent(run: unknown): unknown {
   const summary = summaryObject(objectField(run, "summary"));
   const improvementLog = Array.isArray(objectField(run, "improvementLog")) ? objectField(run, "improvementLog") as unknown[] : [];
-  const recentSignals = improvementLog
-    .slice(-20)
-    .flatMap((entry) => {
-      const signals = objectField(entry, "improvementSignals");
-      return Array.isArray(signals) ? signals : [];
-    })
-    .filter((signal): signal is string => typeof signal === "string");
 
-  return redactSecrets({
-    schema: "pokemon-agent-run-evaluation.v1",
+  return redactSecrets(evaluateAgentRun({
     runId: objectField(run, "runId"),
-    status: summary.status,
-    counts: summary.counts,
-    lastDecision: objectField(objectField(run, "lastDecision"), "payload") ?? objectField(run, "lastDecision"),
-    lastAction: objectField(objectField(run, "lastAction"), "payload") ?? objectField(run, "lastAction"),
-    recentSignals,
-    signalCounts: countStrings(recentSignals),
-    recommendation: recommendAgentAdjustment(summary.status, recentSignals)
-  });
-}
-
-function countStrings(values: readonly string[]): Record<string, number> {
-  const counts: Record<string, number> = {};
-  for (const value of values) {
-    counts[value] = (counts[value] ?? 0) + 1;
-  }
-  return counts;
-}
-
-function recommendAgentAdjustment(status: unknown, signals: readonly string[]): string {
-  if (status === "completed") {
-    return "promote_or_reuse_policy";
-  }
-  if (signals.some((signal) => signal.includes("repeated"))) {
-    return "synthesize_or_tune_policy_to_avoid_loops";
-  }
-  if (signals.includes("low_confidence_decision") || signals.includes("llm_fallback_used")) {
-    return "collect_more_scout_data_or_raise_llm_budget";
-  }
-  return "continue_scouting_or_compare_generated_policy";
+    summary,
+    lastDecision: objectField(run, "lastDecision"),
+    lastAction: objectField(run, "lastAction"),
+    improvementLog
+  }));
 }
 
 async function readJsonIfExists(file: string): Promise<unknown> {
@@ -853,14 +844,17 @@ function renderMapStructure(live) {
     available: 'yes',
     size: String(map.width ?? '?') + 'x' + String(map.height ?? '?'),
     tileset: map.tileset ?? '?',
-    block: map.currentBlock?.id ?? '?',
-    row: map.currentBlock?.row ?? '?',
-    col: map.currentBlock?.col ?? '?',
+    block: map.currentBlockId ?? map.currentBlock?.id ?? '?',
+    semantic: map.currentBlockSemantic?.kind ?? '?',
+    walkability: map.currentBlockSemantic?.walkability ?? '?',
+    row: map.currentBlockRow ?? map.currentBlock?.row ?? '?',
+    col: map.currentBlockCol ?? map.currentBlock?.col ?? '?',
     pointer: map.currentViewPointer ?? '?'
   });
   $('mapCandidates').textContent = j({
-    currentBlock: map.currentBlock,
+    currentBlock: { id: map.currentBlockId, row: map.currentBlockRow, col: map.currentBlockCol, semantic: map.currentBlockSemantic },
     directionCandidates: map.directionCandidates,
+    semanticVisibleBlocks: map.semanticVisibleBlocks,
     visibleBlocks: map.visibleBlocks
   });
 }
