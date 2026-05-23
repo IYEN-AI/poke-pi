@@ -1,6 +1,6 @@
 import "dotenv/config";
-import { execFile } from "node:child_process";
-import { readdir, readFile, rm } from "node:fs/promises";
+import { execFile, spawn } from "node:child_process";
+import { mkdir, open, readdir, readFile, rm } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import { pathToFileURL } from "node:url";
@@ -25,8 +25,9 @@ import { PokemonStateReader } from "./pokemon/PokemonStateReader.js";
 import { FullGameDetector } from "./pokemon/FullGameDetector.js";
 import { Stage1Detector } from "./pokemon/Stage1Detector.js";
 import { startDashboard, type DashboardHandle } from "./dashboardServer.js";
+import { runStrategyLoop } from "./agent/StrategyLoop.js";
 
-type HarnessCommand = "snapshot" | "preflight" | "run" | "press" | "smoke" | "dashboard" | "map-heuristic" | "scout" | "synthesize-policy" | "play-policy" | "status" | "play" | "llm" | "ui" | "doctor" | "stop" | "clean-failed";
+type HarnessCommand = "snapshot" | "preflight" | "run" | "press" | "smoke" | "dashboard" | "map-heuristic" | "scout" | "synthesize-policy" | "play-policy" | "strategy-loop" | "strategy-bg" | "status" | "play" | "llm" | "ui" | "doctor" | "stop" | "clean-failed";
 
 export interface CliOptions {
   readonly command?: HarnessCommand;
@@ -45,6 +46,10 @@ export interface CliOptions {
   readonly policyId?: string;
   readonly policyFile?: string;
   readonly objective?: string;
+  readonly iterations?: number;
+  readonly pollMs?: number;
+  readonly llmEvery?: number;
+  readonly runIdPrefix?: string;
 }
 
 export interface CliIo {
@@ -58,7 +63,7 @@ export interface CliFactories {
   readonly runPreflight?: (config: HarnessConfig) => Promise<MgbaPreflightReport>;
   readonly executePress?: (config: HarnessConfig, action: unknown) => Promise<void>;
   readonly startDashboard?: (config: HarnessConfig, port?: number) => Promise<DashboardHandle>;
-  readonly controlRequest?: (baseUrl: string, path: string, body?: unknown) => Promise<{ status: number; body: unknown }>;
+  readonly controlRequest?: (baseUrl: string, path: string, body?: unknown, method?: "GET" | "POST") => Promise<{ status: number; body: unknown }>;
 }
 
 export interface CliRunner {
@@ -98,6 +103,8 @@ export function getHarnessHelp(): string {
     "  npm run poke -- synthesize-policy --from-run RUN --policy-id ID [--objective TEXT]",
     "  npm run poke -- play-policy --policy-file policies/generated/ID.json [--max-steps N] [--run-id ID]",
     "  npm run poke -- llm [--max-steps N] [--run-id ID] [--port N] [--policy-file policies/generated/ID.json]",
+    "  npm run poke -- strategy-loop [--iterations N] [--max-steps N] [--llm-every N] [--poll-ms N] [--port N]",
+    "  npm run poke -- strategy-bg [--iterations N] [--max-steps N] [--llm-every N] [--poll-ms N] [--port N]",
     "  npm run poke -- ui [--port N]",
     "  npm run poke -- stop",
     "  npm run poke -- clean-failed --yes",
@@ -114,6 +121,8 @@ export function getHarnessHelp(): string {
     "  scout      Alias for play: collect cheap heuristic map/state/action evidence.",
     "  synthesize-policy  Create a validated JSON heuristic policy from a scout run.",
     "  play-policy  Execute a generated JSON heuristic policy artifact.",
+    "  strategy-loop  Poll in foreground and alternate scout/generated/LLM-guided policy runs.",
+    "  strategy-bg  Start strategy-loop as a detached background process and write a log under runs/.strategy/.",
     "  status     Print redacted config and mGBA preflight status.",
     "  play       Start map-aware heuristic Stage 1 with dashboard enabled by default.",
     "  llm        Start OpenAI-compatible Stage 1 with dashboard enabled by default; --policy-file supplies a generated-policy guide.",
@@ -181,6 +190,18 @@ export function parseCliArgs(args: readonly string[]): ParsedOptionResult {
       case "--objective":
         options.objective = parseNonEmpty(args[++index], "--objective", errors);
         break;
+      case "--iterations":
+        options.iterations = parsePositiveInteger(args[++index], "--iterations", errors);
+        break;
+      case "--poll-ms":
+        options.pollMs = parsePositiveInteger(args[++index], "--poll-ms", errors);
+        break;
+      case "--llm-every":
+        options.llmEvery = parsePositiveInteger(args[++index], "--llm-every", errors);
+        break;
+      case "--run-id-prefix":
+        options.runIdPrefix = parseNonEmpty(args[++index], "--run-id-prefix", errors);
+        break;
       default:
         if (arg?.startsWith("--") === true) {
           errors.push(`Unknown option: ${arg}`);
@@ -246,6 +267,10 @@ export async function runCli(
         return await handleSynthesizePolicy(parsed.options, io, factories);
       case "play-policy":
         return await handlePlayPolicy(parsed.options, io, factories);
+      case "strategy-loop":
+        return await handleStrategyLoop(parsed.options, io, factories);
+      case "strategy-bg":
+        return await handleStrategyBackground(parsed.options, io, factories);
       case "play":
         return await handlePlay(parsed.options, io, factories);
       case "llm":
@@ -398,6 +423,77 @@ async function handlePlayPolicy(options: CliOptions, io: CliIo, factories: CliFa
   const result = await runner.run();
   io.stdout(redactSecrets({ command: "play-policy", policyFile: options.policyFile, result }));
   return result.status === "completed" ? 0 : 1;
+}
+
+async function handleStrategyLoop(options: CliOptions, io: CliIo, factories: CliFactories): Promise<number> {
+  const config = loadCommandConfig({
+    ...options,
+    policy: "heuristic",
+    mode: options.mode ?? "stage1",
+    runId: options.runId ?? `strategy-${Date.now()}`
+  }, factories, true);
+  const control = await getControlServer(config, options.dashboardPort, io, factories);
+  const startedAt = new Date().toISOString().replace(/[:.]/g, "-");
+  const result = await runStrategyLoop({
+    baseUrl: control.url,
+    maxIterations: options.iterations ?? 12,
+    maxSteps: options.maxSteps ?? 80,
+    pollMs: options.pollMs ?? 2000,
+    llmEvery: options.llmEvery ?? 4,
+    runIdPrefix: options.runIdPrefix ?? `strategy-${startedAt}`,
+    policyIdPrefix: options.policyId ?? `strategy-policy-${startedAt}`,
+    objective: options.objective,
+    request: (baseUrl, pathName, body, method = "POST") => requestControl(baseUrl, pathName, body, factories, method),
+    log: (event) => io.stdout(redactSecrets({ command: "strategy-loop", event }))
+  });
+  io.stdout(redactSecrets({ command: "strategy-loop", dashboardUrl: control.url, result }));
+  return 0;
+}
+
+async function handleStrategyBackground(options: CliOptions, io: CliIo, factories: CliFactories): Promise<number> {
+  if (factories.controlRequest !== undefined || factories.startDashboard !== undefined) {
+    return handleStrategyLoop(options, io, factories);
+  }
+
+  const config = loadCommandConfig(options, factories, true);
+  const logDir = path.join(config.evidenceDir, ".strategy");
+  await mkdir(logDir, { recursive: true });
+  const startedAt = new Date().toISOString().replace(/[:.]/g, "-");
+  const logPath = path.join(logDir, `${options.runIdPrefix ?? "strategy"}-${startedAt}.log`);
+  const logHandle = await open(logPath, "a");
+  const childArgs = [
+    "src/index.ts",
+    "strategy-loop",
+    "--iterations",
+    String(options.iterations ?? 12),
+    "--max-steps",
+    String(options.maxSteps ?? 80),
+    "--poll-ms",
+    String(options.pollMs ?? 2000),
+    "--llm-every",
+    String(options.llmEvery ?? 4),
+    "--port",
+    String(options.dashboardPort ?? 3030),
+    "--run-id-prefix",
+    options.runIdPrefix ?? `strategy-${startedAt}`
+  ];
+  if (options.objective !== undefined) {
+    childArgs.push("--objective", options.objective);
+  }
+  if (options.policyId !== undefined) {
+    childArgs.push("--policy-id", options.policyId);
+  }
+
+  const child = spawn("./node_modules/.bin/tsx", childArgs, {
+    cwd: process.cwd(),
+    env: process.env,
+    detached: true,
+    stdio: ["ignore", logHandle.fd, logHandle.fd]
+  });
+  child.unref();
+  await logHandle.close();
+  io.stdout(redactSecrets({ command: "strategy-bg", pid: child.pid, logPath, args: childArgs }));
+  return 0;
 }
 
 
@@ -642,7 +738,7 @@ async function requestControl(
   method = "POST"
 ): Promise<{ status: number; body: unknown }> {
   if (factories.controlRequest !== undefined) {
-    return factories.controlRequest(baseUrl, pathName, body);
+    return factories.controlRequest(baseUrl, pathName, body, method as "GET" | "POST");
   }
 
   const response = await fetch(`${baseUrl}${pathName}`, {
@@ -819,7 +915,7 @@ function parseNonEmpty(value: string | undefined, name: string, errors: string[]
 }
 
 function isHarnessCommand(value: string): value is HarnessCommand {
-  return value === "snapshot" || value === "preflight" || value === "run" || value === "press" || value === "smoke" || value === "dashboard" || value === "map-heuristic" || value === "scout" || value === "synthesize-policy" || value === "play-policy" || value === "status" || value === "play" || value === "llm" || value === "ui" || value === "doctor" || value === "stop" || value === "clean-failed";
+  return value === "snapshot" || value === "preflight" || value === "run" || value === "press" || value === "smoke" || value === "dashboard" || value === "map-heuristic" || value === "scout" || value === "synthesize-policy" || value === "play-policy" || value === "strategy-loop" || value === "strategy-bg" || value === "status" || value === "play" || value === "llm" || value === "ui" || value === "doctor" || value === "stop" || value === "clean-failed";
 }
 
 interface MutableCliOptions {
@@ -839,6 +935,10 @@ interface MutableCliOptions {
   policyId?: string;
   policyFile?: string;
   objective?: string;
+  iterations?: number;
+  pollMs?: number;
+  llmEvery?: number;
+  runIdPrefix?: string;
 }
 
 if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {

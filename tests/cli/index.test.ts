@@ -21,6 +21,7 @@ describe("CLI", () => {
     expect(io.out.join("\n")).toContain("clean-failed");
     expect(io.out.join("\n")).toContain("synthesize-policy");
     expect(io.out.join("\n")).toContain("play-policy");
+    expect(io.out.join("\n")).toContain("strategy-loop");
     expect(io.out.join("\n")).toContain("heuristic|openai");
     expect(io.out.join("\n")).toContain("stage1|full-game");
   });
@@ -32,6 +33,7 @@ describe("CLI", () => {
     const play = parseCliArgs(["play", "--max-steps", "5", "--run-id", "easy", "--port", "3032"]);
     const synthesize = parseCliArgs(["synthesize-policy", "--from-run", "scout-1", "--policy-id", "pallet-v1", "--objective", "find starter"]);
     const playPolicy = parseCliArgs(["play-policy", "--policy-file", "policies/generated/pallet-v1.json", "--max-steps", "11"]);
+    const strategyLoop = parseCliArgs(["strategy-loop", "--iterations", "3", "--poll-ms", "10", "--llm-every", "2", "--run-id-prefix", "unit"]);
     const cleanFailed = parseCliArgs(["clean-failed", "--yes"]);
 
     expect(parsed.errors).toEqual([]);
@@ -46,6 +48,8 @@ describe("CLI", () => {
     expect(synthesize.options).toMatchObject({ command: "synthesize-policy", fromRun: "scout-1", policyId: "pallet-v1", objective: "find starter" });
     expect(playPolicy.errors).toEqual([]);
     expect(playPolicy.options).toMatchObject({ command: "play-policy", policyFile: "policies/generated/pallet-v1.json", maxSteps: 11 });
+    expect(strategyLoop.errors).toEqual([]);
+    expect(strategyLoop.options).toMatchObject({ command: "strategy-loop", iterations: 3, pollMs: 10, llmEvery: 2, runIdPrefix: "unit" });
     expect(cleanFailed.errors).toEqual([]);
     expect(cleanFailed.options).toMatchObject({ command: "clean-failed", yes: true });
   });

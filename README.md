@@ -108,6 +108,8 @@ npm run poke -- stop
 | `npm run poke -- synthesize-policy --from-run scout-1 --policy-id pallet-v1` | Creates `policies/generated/pallet-v1.json`, a schema-validated heuristic policy DSL artifact. | Let Hermes turn scout logs into a new executable heuristic. |
 | `npm run poke -- play-policy --policy-file policies/generated/pallet-v1.json --run-id exec-1` | Executes a generated JSON heuristic policy through the normal harness runner. | Validate synthesized policies before using expensive LLM execution. |
 | `npm run poke -- llm --max-steps 100 --run-id llm-1 --policy-file policies/generated/pallet-v1.json` | Runs Stage 1 through the configured OpenAI-compatible provider and optionally injects a generated policy as a guide. | Use LLM for higher-cost execution while respecting Hermes' synthesized heuristic recommendation. |
+| `npm run poke -- strategy-bg --iterations 12 --max-steps 80 --llm-every 4` | Starts a detached strategy loop that polls the control server, runs scout/generated/LLM phases, evaluates results, and updates generated policies. | Let the repo keep improving policies in the background. |
+| `npm run poke -- strategy-loop --iterations 4 --max-steps 60` | Same strategy loop in the foreground with event logs printed to stdout. | Debug the background strategist. |
 | `npm run poke -- ui --port 3030` | Starts only the web dashboard/control server. | Watch screen/RAM/telemetry, start heuristic or LLM agent runs, and stop the active run. |
 | `npm run poke -- press A --frames 5` | Sends one safe manual button input. | Smoke checks or unblocking a prompt manually. |
 | `npm run poke -- stop` | Stops repo-started Node harness/dashboard processes. Leaves mGBA and mGBA-http alone. | Cleanly stop automation without closing the emulator. |
@@ -126,6 +128,10 @@ npm run poke -- stop
 --policy-id ID      Generated policy artifact id.
 --policy-file FILE  Generated policy JSON path.
 --objective TEXT    Optional policy synthesis objective.
+--iterations N      Number of strategy loop phases to run.
+--poll-ms N         Strategy loop polling interval while a child run is active.
+--llm-every N       Run an LLM-guided phase every N strategy iterations after a policy exists.
+--run-id-prefix ID  Prefix for strategy-generated run IDs.
 --yes               Required for destructive cleanup commands.
 ```
 
@@ -189,6 +195,31 @@ npm run poke -- llm --policy-file policies/generated/pallet-v1.json --max-steps 
 ```
 
 Scout runs collect map/action/outcome telemetry cheaply; Hermes can synthesize a JSON policy from those logs; the harness validates and executes that policy; then the same policy file can be passed to `llm` as a guide. In guided LLM mode, the generated policy produces a recommended decision first; the LLM sees that recommendation plus current RAM/recent action evidence and may follow it or override it with an observed-state rationale.
+
+### Background strategy loop
+
+Use this when you want the agent side to keep polling, running policies, and updating policy artifacts without manual intervention:
+
+```bash
+npm run poke -- strategy-bg --iterations 12 --max-steps 80 --llm-every 4 --run-id-prefix bg-strategy
+```
+
+The detached process writes logs under `runs/.strategy/`. Its policy-selection strategy is:
+
+1. Start with a cheap heuristic scout run when no generated policy exists.
+2. Evaluate the run through `/api/agent/evaluate/:runId`.
+3. Synthesize or update a generated JSON policy from run telemetry unless the evaluator says the policy can be reused/promoted.
+4. Run generated-policy executions for low-cost validation.
+5. Every `--llm-every N` iterations, run OpenAI-compatible LLM execution with the latest generated policy injected as a guide.
+6. Repeat until `--iterations` is exhausted.
+
+Foreground debug mode:
+
+```bash
+npm run poke -- strategy-loop --iterations 4 --max-steps 60 --poll-ms 1000
+```
+
+The strategy loop still never sends manual gamepad input. It only starts harness runs and updates policy files; actual button actions are produced by the selected policy inside the harness.
 
 ### What stays outside the wrapper
 
