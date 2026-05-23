@@ -36,6 +36,7 @@ export interface PokemonStateSnapshot {
 export interface RecentStateSnapshot extends PokemonStateSnapshot {
   step?: number;
   mapKnowledge?: MapKnowledgeSummary;
+  recentPostActionObservations?: readonly unknown[];
 }
 
 export interface PolicyInput {
@@ -45,6 +46,7 @@ export interface PolicyInput {
   recentStates?: readonly RecentStateSnapshot[];
   step?: number;
   mapKnowledge?: MapKnowledgeSummary;
+  recentPostActionObservations?: readonly unknown[];
 }
 
 export interface Policy {

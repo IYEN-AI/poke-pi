@@ -271,11 +271,15 @@ function buildFullGameMessages(input: PolicyInput, guide?: LLMGuideContext): Cha
 
 function stateWithMapKnowledge(input: PolicyInput): unknown {
   const state = input.currentState ?? input.state;
-  if (input.mapKnowledge === undefined || state === undefined || state === null || typeof state !== "object") {
+  if (state === undefined || state === null || typeof state !== "object") {
     return state;
   }
 
-  return { ...(state as Record<string, unknown>), mapKnowledge: input.mapKnowledge };
+  return {
+    ...(state as Record<string, unknown>),
+    mapKnowledge: input.mapKnowledge,
+    recentPostActionObservations: input.recentPostActionObservations
+  };
 }
 
 function guidePromptSection(guide: LLMGuideContext | undefined): string {
@@ -297,6 +301,7 @@ function stage1RouteFacts(): string {
     "Stage 1 route facts:",
     "Use these as compact map geometry facts for the current wCurMap/wYCoord/wXCoord/screenTextKind/wPartyCount/wIsInBattle/playerFacingDirection/recentActions state, not as a step-numbered global timeline.",
     "Map knowledge facts are learned from live movement: blocked/walkable edges are verified by coordinate changes; mapTransitions record real mapId changes and should not be merged unless a later semantic alias layer says they are the same place.",
+    "Recent post-action observations are short-cycle probes captured between normal decision-loop iterations; use their mapChanged and pixelChanged fields to judge whether a transition animation or map identity change occurred before choosing the next action.",
     "If boot/title state has all-zero RAM or title/menu-like text, choose current-state menu/title actions such as Start or A until gameplay state appears.",
     "Oak/name flow is text/menu driven: when screenTextKind or recentActions show naming, dialog, or menu prompts, choose the current prompt action rather than walking randomly.",
     "Red House 2F is wCurMap=38: from the bedroom, route toward the stair by getting to x=5 and moving Up onto the stair tile when aligned.",

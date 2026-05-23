@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import type { HarnessConfig } from "../config.js";
 import type { Policy, PolicyInput, PokemonStateSnapshot, RecentStateSnapshot } from "../ai/Policy.js";
 import type { PolicyDecision } from "../control/ActionTypes.js";
@@ -92,6 +94,8 @@ type RunnerFailure = {
 
 const DEFAULT_REPEATED_STATE_THRESHOLD = 30;
 const RECENT_LIMIT = 20;
+const POST_ACTION_POLL_COUNT = 4;
+const POST_ACTION_POLL_INTERVAL_MS = 80;
 
 export class HarnessRunner<TState = PokemonStateSnapshot> {
   private readonly config: HarnessRunnerOptions<TState>["config"];
@@ -110,6 +114,7 @@ export class HarnessRunner<TState = PokemonStateSnapshot> {
   private readonly recentStates: RecentStateSnapshot[] = [];
   private readonly recentStateHashes: string[] = [];
   private readonly last20Actions: RecordedActionSummary[] = [];
+  private readonly recentPostActionObservations: PostActionObservation[] = [];
   private readonly mapKnowledge = new MapKnowledgeTracker();
   private startedAt: string | undefined;
   private step = 0;
@@ -172,10 +177,12 @@ export class HarnessRunner<TState = PokemonStateSnapshot> {
         await this.controller.execute(decision.action);
         const actionSummary = this.recordAction(snapshot, decision);
         await this.evidence.recordAction(actionSummary);
+        const postActionObservation = await this.pollPostActionState(snapshot, actionSummary);
+        this.recordPostActionObservation(postActionObservation);
 
         const detectorBefore = this.detector.getStatus();
         const detectorStatus = this.detector.update(toDetectorState(snapshot.state), decision.action, snapshot.frame);
-        await this.recordPokemonTelemetry(snapshot, decision, actionSummary, detectorBefore, detectorStatus);
+        await this.recordPokemonTelemetry(snapshot, decision, actionSummary, detectorBefore, detectorStatus, postActionObservation);
         status = detectorStatus.status;
 
         if (status === "completed" || status === "failed_stuck") {
@@ -230,7 +237,8 @@ export class HarnessRunner<TState = PokemonStateSnapshot> {
       recentStates: [...this.recentStates],
       recentActions: [...this.last20Actions],
       step: this.step,
-      mapKnowledge: this.mapKnowledge.summarize()
+      mapKnowledge: this.mapKnowledge.summarize(),
+      recentPostActionObservations: [...this.recentPostActionObservations]
     };
   }
 
@@ -241,6 +249,83 @@ export class HarnessRunner<TState = PokemonStateSnapshot> {
     this.recentStateHashes.push(snapshot.stateHash);
     trimToLimit(this.recentStates, RECENT_LIMIT);
     trimToLimit(this.recentStateHashes, RECENT_LIMIT);
+  }
+
+  private async pollPostActionState(
+    snapshot: HarnessSnapshot<TState>,
+    actionSummary: RecordedActionSummary
+  ): Promise<PostActionObservation | undefined> {
+    if (!containsDirectionalAction(actionSummary.action)) {
+      return undefined;
+    }
+
+    const before = toPolicyState(snapshot.state);
+    const beforeScreenshotHash = await fileHash(snapshot.screenshot.path);
+    const visualSamples: PostActionVisualSample[] = [];
+    for (let poll = 1; poll <= POST_ACTION_POLL_COUNT; poll += 1) {
+      await this.sleep(POST_ACTION_POLL_INTERVAL_MS);
+      const state = toPolicyState(await this.stateReader.readState());
+      const visualSample = await this.capturePostActionVisualSample(snapshot, poll, beforeScreenshotHash);
+      if (visualSample !== undefined) {
+        visualSamples.push(visualSample);
+      }
+      this.mapKnowledge.observeTransition(before, actionSummary, state, this.step);
+      if (locationChanged(before, state)) {
+        const observation: PostActionObservation = {
+          schema: "pokemon-post-action-observation.v1",
+          step: this.step,
+          poll,
+          action: actionSummary.action,
+          before: locationSummary(before),
+          after: locationSummary(state),
+          mapChanged: (before.wCurMap ?? before.mapId) !== (state.wCurMap ?? state.mapId),
+          pixelChanged: visualSamples.some((sample) => sample.pixelChanged),
+          visualSamples,
+          mapKnowledge: this.mapKnowledge.summarize()
+        };
+        await this.evidence.recordTelemetry?.({ type: "post_action_map_observation", ...observation });
+        return observation;
+      }
+    }
+
+    return {
+      schema: "pokemon-post-action-observation.v1",
+      step: this.step,
+      poll: POST_ACTION_POLL_COUNT,
+      action: actionSummary.action,
+      before: locationSummary(before),
+      after: locationSummary(before),
+      mapChanged: false,
+      pixelChanged: visualSamples.some((sample) => sample.pixelChanged),
+      visualSamples,
+      mapKnowledge: this.mapKnowledge.summarize()
+    };
+  }
+
+  private async capturePostActionVisualSample(
+    snapshot: HarnessSnapshot<TState>,
+    poll: number,
+    beforeScreenshotHash: string | undefined
+  ): Promise<PostActionVisualSample | undefined> {
+    try {
+      const path = await this.client.screenshot();
+      await this.evidence.recordScreenshot({ path, frame: snapshot.frame, step: this.step, note: `post_action_probe_${poll}` });
+      const screenshotHash = await fileHash(path);
+      return {
+        poll,
+        screenshotPath: path,
+        screenshotHash,
+        pixelChanged: beforeScreenshotHash !== undefined && screenshotHash !== undefined && beforeScreenshotHash !== screenshotHash
+      };
+    } catch {
+      return undefined;
+    }
+  }
+
+  private recordPostActionObservation(observation: PostActionObservation | undefined): void {
+    if (observation === undefined) return;
+    this.recentPostActionObservations.push(observation);
+    trimToLimit(this.recentPostActionObservations, RECENT_LIMIT);
   }
 
   private recordAction(snapshot: HarnessSnapshot<TState>, decision: PolicyDecision): RecordedActionSummary {
@@ -262,7 +347,8 @@ export class HarnessRunner<TState = PokemonStateSnapshot> {
     decision: PolicyDecision,
     actionSummary: RecordedActionSummary,
     detectorBefore: DetectorStatus,
-    detectorAfter: DetectorStatus
+    detectorAfter: DetectorStatus,
+    postActionObservation?: PostActionObservation
   ): Promise<void> {
     if (this.evidence.recordTelemetry === undefined) {
       return;
@@ -282,7 +368,8 @@ export class HarnessRunner<TState = PokemonStateSnapshot> {
       repeatedStateThreshold: this.repeatedStateThreshold,
       llmCalls: this.llmCalls,
       maxLlmCalls: this.maxLlmCalls,
-      mapKnowledge: this.mapKnowledge.summarize()
+      mapKnowledge: this.mapKnowledge.summarize(),
+      postActionObservation
     }));
   }
 
@@ -364,6 +451,7 @@ interface PokemonTelemetryInput<TState> {
   readonly llmCalls: number;
   readonly maxLlmCalls: number;
   readonly mapKnowledge?: unknown;
+  readonly postActionObservation?: PostActionObservation;
 }
 
 function createPokemonTelemetry<TState>(input: PokemonTelemetryInput<TState>): unknown {
@@ -431,6 +519,7 @@ function createPokemonTelemetry<TState>(input: PokemonTelemetryInput<TState>): u
       fallback: input.decision.rationale.includes("LLM fallback after") || input.decision.observedStateCitations.some((citation) => citation.includes("LLM fallback after"))
     },
     mapKnowledge: input.mapKnowledge,
+    postActionObservation: input.postActionObservation,
     progress: {
       status: input.detectorAfter.status,
       checkpoints: input.detectorAfter.checkpoints,
@@ -453,6 +542,26 @@ function createPokemonTelemetry<TState>(input: PokemonTelemetryInput<TState>): u
       recentActions: input.recentActions
     })
   };
+}
+
+interface PostActionObservation {
+  readonly schema: "pokemon-post-action-observation.v1";
+  readonly step: number;
+  readonly poll: number;
+  readonly action: PolicyDecision["action"];
+  readonly before: ReturnType<typeof locationSummary>;
+  readonly after: ReturnType<typeof locationSummary>;
+  readonly mapChanged: boolean;
+  readonly mapKnowledge: unknown;
+  readonly pixelChanged: boolean;
+  readonly visualSamples: readonly PostActionVisualSample[];
+}
+
+interface PostActionVisualSample {
+  readonly poll: number;
+  readonly screenshotPath: string;
+  readonly screenshotHash?: string;
+  readonly pixelChanged: boolean;
 }
 
 function routeContext(state: PokemonStateSnapshot): string {
@@ -580,6 +689,37 @@ function statusForErrorCode(code: HarnessErrorCode): HarnessStatus {
     case "SCREENSHOT_FAILED":
       return "failed_mgba";
   }
+}
+
+async function fileHash(path: string): Promise<string | undefined> {
+  try {
+    return createHash("sha256").update(await readFile(path)).digest("hex");
+  } catch {
+    return undefined;
+  }
+}
+
+function containsDirectionalAction(action: PolicyDecision["action"]): boolean {
+  if (action.type === "sequence") {
+    return action.actions.some((entry) => containsDirectionalAction(entry));
+  }
+
+  return (action.type === "press" || action.type === "hold") && ["Up", "Right", "Down", "Left"].includes(action.button);
+}
+
+function locationChanged(before: PokemonStateSnapshot, after: PokemonStateSnapshot): boolean {
+  return (before.wCurMap ?? before.mapId) !== (after.wCurMap ?? after.mapId) ||
+    (before.wYCoord ?? before.y) !== (after.wYCoord ?? after.y) ||
+    (before.wXCoord ?? before.x) !== (after.wXCoord ?? after.x);
+}
+
+function locationSummary(state: PokemonStateSnapshot): { mapId?: unknown; y?: unknown; x?: unknown; facing?: unknown } {
+  return {
+    mapId: state.wCurMap ?? state.mapId,
+    y: state.wYCoord ?? state.y,
+    x: state.wXCoord ?? state.x,
+    facing: state.playerFacingDirection
+  };
 }
 
 function toPolicyState(value: unknown): PokemonStateSnapshot {

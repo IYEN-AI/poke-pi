@@ -157,6 +157,48 @@ describe("HarnessRunner", () => {
     });
   });
 
+  it("captures short-cycle post-action map and pixel observations without changing main loop steps", async () => {
+    const evidence = new FakeEvidenceRecorder();
+    const runner = createRunner({
+      evidence,
+      policy: {
+        async chooseAction() {
+          return {
+            action: { type: "hold", button: "Up", frames: 18 },
+            rationale: "probe north transition",
+            confidence: 0.6,
+            observedStateCitations: ["test=true"]
+          };
+        }
+      },
+      states: [
+        state({ wCurMap: 0, wYCoord: 1, wXCoord: 10 }),
+        state({ wCurMap: 12, wYCoord: 35, wXCoord: 10 })
+      ],
+      budgets: { maxSteps: 1, repeatedStateThreshold: 10 }
+    });
+
+    const result = await runner.run();
+    const postActionEvent = evidence.telemetry.find((entry) => isRecord(entry) && entry.type === "post_action_map_observation");
+    const pokemonTelemetry = evidence.telemetry.find((entry) => isRecord(entry) && entry.schema === "pokemon-harness-telemetry.v1");
+
+    expect(result.totalSteps).toBe(1);
+    expect(postActionEvent).toMatchObject({
+      type: "post_action_map_observation",
+      schema: "pokemon-post-action-observation.v1",
+      mapChanged: true,
+      before: { mapId: 0, y: 1, x: 10 },
+      after: { mapId: 12, y: 35, x: 10 }
+    });
+    expect(pokemonTelemetry).toMatchObject({
+      postActionObservation: {
+        schema: "pokemon-post-action-observation.v1",
+        mapChanged: true
+      }
+    });
+  });
+
+
   it("maps mGBA, invalid-state, policy, and controller errors to safe final statuses", async () => {
     await expectFailure(
       createRunner({ frameError: new HarnessError("MGBA_UNAVAILABLE", "mGBA down") }),
@@ -370,4 +412,8 @@ class FakeEvidenceRecorder implements RunnerEvidenceRecorder {
 
 function fixedNow(): Date {
   return new Date("2026-05-22T00:00:00.000Z");
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }

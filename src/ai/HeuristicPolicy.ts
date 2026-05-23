@@ -1,5 +1,5 @@
 import { PolicyDecisionSchema } from "../control/ActionSchema.js";
-import type { HoldAction, PolicyDecision, PressAction } from "../control/ActionTypes.js";
+import type { HarnessAction, HoldAction, PolicyDecision, PressAction } from "../control/ActionTypes.js";
 import type { MgbaButton } from "../mgba/MgbaTypes.js";
 import { mapKnowledgeFromRecent } from "../pokemon/MapKnowledge.js";
 import type { MapKnowledgeSummary } from "../pokemon/MapKnowledge.js";
@@ -38,10 +38,11 @@ export class HeuristicPolicy implements Policy {
     }
 
     if (isInBattle(state)) {
+      const battleAction = chooseBattleAction(state);
       return validateDecision({
-        action: press("A"),
-        rationale: "Active battle is visible, so press A to progress battle menus or selected moves without inventing a route.",
-        confidence: 0.72,
+        action: battleAction.action,
+        rationale: battleAction.rationale,
+        confidence: battleAction.confidence,
         observedStateCitations: citations
       });
     }
@@ -91,6 +92,16 @@ export class HeuristicPolicy implements Policy {
         action: homeNavigation.action,
         rationale: homeNavigation.rationale,
         confidence: 0.68,
+        observedStateCitations: citations
+      });
+    }
+
+    const postStarterRouteOneNavigation = choosePostStarterRouteOneNavigationAction(state);
+    if (postStarterRouteOneNavigation !== undefined) {
+      return validateDecision({
+        action: postStarterRouteOneNavigation.action,
+        rationale: postStarterRouteOneNavigation.rationale,
+        confidence: 0.6,
         observedStateCitations: citations
       });
     }
@@ -327,6 +338,10 @@ function press(button: MgbaButton): PressAction {
   return { type: "press", button, frames: DEFAULT_PRESS_FRAMES };
 }
 
+function pressSequence(buttons: readonly MgbaButton[]): HarnessAction {
+  return { type: "sequence", actions: buttons.map((button) => press(button)) };
+}
+
 function hold(button: MgbaButton): HoldAction {
   return { type: "hold", button, frames: DEFAULT_HOLD_FRAMES };
 }
@@ -337,6 +352,27 @@ function validateDecision(decision: PolicyDecision): PolicyDecision {
 
 function isInBattle(state: PokemonStateSnapshot): boolean {
   return state.wIsInBattle === true || (typeof state.wIsInBattle === "number" && state.wIsInBattle !== 0);
+}
+
+function chooseBattleAction(state: PokemonStateSnapshot): { action: HarnessAction; rationale: string; confidence: number } {
+  const screenText = typeof state.screenText === "string" ? state.screenText : "";
+  const lowHp = typeof state.wBattleMonHP === "number" && state.wBattleMonHP <= 3;
+  const wildBattle = state.wIsInBattle === 1 || (typeof state.battle === "object" && state.battle !== null && (state.battle as { kind?: unknown }).kind === "wild");
+  const battleMenuVisible = /FIGHT|ITEM|PKMN|RUN/i.test(screenText);
+
+  if (wildBattle && lowHp && battleMenuVisible) {
+    return {
+      action: pressSequence(["Down", "Right", "A"]),
+      rationale: "Wild battle menu is visible and party HP is critically low, so choose RUN instead of attacking and blocking overworld exploration.",
+      confidence: 0.69
+    };
+  }
+
+  return {
+    action: press("A"),
+    rationale: "Active battle is visible, so press A to progress battle text, menus, or the selected safe move without inventing a route.",
+    confidence: 0.72
+  };
 }
 
 function isTextOrMenuActive(state: PokemonStateSnapshot): boolean {
@@ -415,6 +451,32 @@ function chooseHomeNavigationAction(
   }
 
   return undefined;
+}
+
+function choosePostStarterRouteOneNavigationAction(
+  state: PokemonStateSnapshot
+): Pick<PolicyDecision, "action" | "rationale"> | undefined {
+  if (getPartyCount(state) === 0 || state.wCurMap !== 12 || state.wYCoord === undefined || state.wXCoord === undefined) {
+    return undefined;
+  }
+
+  const screenText = typeof state.screenText === "string" ? state.screenText.trim() : "";
+  const screenTextKind = typeof state.screenTextKind === "string" ? state.screenTextKind : "none";
+  if (screenText.length > 0 || screenTextKind !== "none") {
+    return undefined;
+  }
+
+  return {
+    action: hold(chooseRouteOneStep(state.wYCoord, state.wXCoord)),
+    rationale:
+      "Player is on Route 1 after starter acquisition with only stale empty text flags, so continue northward route exploration instead of waiting for repeated coordinates."
+  };
+}
+
+function chooseRouteOneStep(y: number, x: number): MgbaButton {
+  if (x > 10) return "Left";
+  if (x < 10) return "Right";
+  return y > 0 ? "Up" : "Up";
 }
 
 function choosePostStarterOverworldNavigationAction(

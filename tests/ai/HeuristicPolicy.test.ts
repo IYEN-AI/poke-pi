@@ -552,9 +552,9 @@ describe("HeuristicPolicy", () => {
       recentStates: [routeOneState, routeOneState, routeOneState]
     });
 
-    expect(decision.action.type).toBe("press");
-    if (decision.action.type !== "press") {
-      throw new Error("expected press action");
+    expect(decision.action.type).toBe("hold");
+    if (decision.action.type !== "hold") {
+      throw new Error("expected hold action");
     }
     expect(["Up", "Right", "Down", "Left"]).toContain(decision.action.button);
     expect(decision.action).not.toEqual({ type: "press", button: "B", frames: 5 });
@@ -576,6 +576,49 @@ describe("HeuristicPolicy", () => {
       "sameCoordRepeats=3;bootTitleZeroSignal=false;bootTitleRepeats=0"
     );
   });
+
+  it("moves immediately on Route 1 with stale empty text flags instead of waiting", async () => {
+    const policy = new HeuristicPolicy();
+    const routeOneState: PokemonStateSnapshot = {
+      ...baseState,
+      wCurMap: 12,
+      wYCoord: 35,
+      wXCoord: 11,
+      wTextBoxID: 1,
+      wLetterPrintingDelayFlags: 1,
+      screenText: "",
+      screenTextKind: "none"
+    };
+
+    const decision = await policy.chooseAction({ state: routeOneState });
+
+    expect(decision.action).toEqual({ type: "hold", button: "Left", frames: 18 });
+    expect(decision.rationale).toContain("Route 1");
+  });
+
+  it("runs from low-HP wild battles when the battle menu is visible", async () => {
+    const policy = new HeuristicPolicy();
+    const decision = await policy.chooseAction({
+      state: {
+        ...baseState,
+        wIsInBattle: 1,
+        wBattleMonHP: 1,
+        screenText: "FIGHT ITEM PKMN RUN",
+        screenTextKind: "overworld_text"
+      }
+    });
+
+    expect(decision.action).toEqual({
+      type: "sequence",
+      actions: [
+        { type: "press", button: "Down", frames: 5 },
+        { type: "press", button: "Right", frames: 5 },
+        { type: "press", button: "A", frames: 5 }
+      ]
+    });
+    expect(decision.rationale).toContain("RUN");
+  });
+
 
   it("returns schema-valid decisions with rationale and observed-state citations", async () => {
     const policy = new HeuristicPolicy();
