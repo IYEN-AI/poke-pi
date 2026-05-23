@@ -229,7 +229,7 @@ function buildMessages(input: PolicyInput, harnessMode: HarnessMode, guide?: LLM
       content: [
         "Role: Pokemon Red/Blue controller for an mGBA harness.",
         "Stage 1 objective: progress from the Pallet start through Oak/starter flow, starter acquisition, Rival battle entry, and Rival battle exit using only current observed state.",
-        `Current RAM-derived state JSON: ${stableJson(input.currentState ?? input.state)}`,
+        `Current RAM-derived state JSON: ${stableJson(stateWithMapKnowledge(input))}`,
         `Recent actions summary: ${stableJson(input.recentActions ?? input.recentStates ?? [])}`,
         stage1RouteFacts(),
         guidePromptSection(guide),
@@ -257,7 +257,7 @@ function buildFullGameMessages(input: PolicyInput, guide?: LLMGuideContext): Cha
         "Badges are read-only progress signals only; wObtainedBadges, badgeCount, and badgesObtained are not completion by themselves.",
         "Do not request or imply memory writes, emulator RAM mutation APIs, ROM-derived assets, map graphics, walkthrough text, or precomputed global input timelines.",
         "Do not claim route facts alone, Rival battle exit, or all badges as full-game completion without Hall of Fame observation.",
-        `Current RAM-derived state JSON: ${stableJson(input.currentState ?? input.state)}`,
+        `Current RAM-derived state JSON: ${stableJson(stateWithMapKnowledge(input))}`,
         `Recent actions summary: ${stableJson(input.recentActions ?? input.recentStates ?? [])}`,
         guidePromptSection(guide),
         `Allowed action schema: ${stableJson(createPolicyDecisionJsonSchema())}`,
@@ -267,6 +267,15 @@ function buildFullGameMessages(input: PolicyInput, guide?: LLMGuideContext): Cha
       ].join("\n")
     }
   ];
+}
+
+function stateWithMapKnowledge(input: PolicyInput): unknown {
+  const state = input.currentState ?? input.state;
+  if (input.mapKnowledge === undefined || state === undefined || state === null || typeof state !== "object") {
+    return state;
+  }
+
+  return { ...(state as Record<string, unknown>), mapKnowledge: input.mapKnowledge };
 }
 
 function guidePromptSection(guide: LLMGuideContext | undefined): string {
@@ -287,6 +296,7 @@ function stage1RouteFacts(): string {
   return [
     "Stage 1 route facts:",
     "Use these as compact map geometry facts for the current wCurMap/wYCoord/wXCoord/screenTextKind/wPartyCount/wIsInBattle/playerFacingDirection/recentActions state, not as a step-numbered global timeline.",
+    "Map knowledge facts are learned from live movement: blocked/walkable edges are verified by coordinate changes; mapTransitions record real mapId changes and should not be merged unless a later semantic alias layer says they are the same place.",
     "If boot/title state has all-zero RAM or title/menu-like text, choose current-state menu/title actions such as Start or A until gameplay state appears.",
     "Oak/name flow is text/menu driven: when screenTextKind or recentActions show naming, dialog, or menu prompts, choose the current prompt action rather than walking randomly.",
     "Red House 2F is wCurMap=38: from the bedroom, route toward the stair by getting to x=5 and moving Up onto the stair tile when aligned.",

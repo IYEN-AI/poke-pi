@@ -1,4 +1,5 @@
 import type { PolicyDecision } from "../control/ActionTypes.js";
+import type { MapKnowledgeSummary } from "../pokemon/MapKnowledge.js";
 import type { PokemonMapStructure } from "../pokemon/PokemonTypes.js";
 
 export interface PokemonStateSnapshot {
@@ -28,11 +29,13 @@ export interface PokemonStateSnapshot {
   menuActive?: boolean;
   textActive?: boolean;
   mapStructure?: PokemonMapStructure;
+  mapKnowledge?: MapKnowledgeSummary;
   [key: string]: unknown;
 }
 
 export interface RecentStateSnapshot extends PokemonStateSnapshot {
   step?: number;
+  mapKnowledge?: MapKnowledgeSummary;
 }
 
 export interface PolicyInput {
@@ -41,6 +44,7 @@ export interface PolicyInput {
   recentActions?: readonly unknown[];
   recentStates?: readonly RecentStateSnapshot[];
   step?: number;
+  mapKnowledge?: MapKnowledgeSummary;
 }
 
 export interface Policy {

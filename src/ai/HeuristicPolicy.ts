@@ -1,6 +1,8 @@
 import { PolicyDecisionSchema } from "../control/ActionSchema.js";
 import type { HoldAction, PolicyDecision, PressAction } from "../control/ActionTypes.js";
 import type { MgbaButton } from "../mgba/MgbaTypes.js";
+import { mapKnowledgeFromRecent } from "../pokemon/MapKnowledge.js";
+import type { MapKnowledgeSummary } from "../pokemon/MapKnowledge.js";
 import type { PlayerFacingDirection, PokemonMapDirectionCandidate, PokemonMapStructure } from "../pokemon/PokemonTypes.js";
 import type { Policy, PolicyInput, PokemonStateSnapshot, RecentStateSnapshot } from "./Policy.js";
 
@@ -126,7 +128,13 @@ export class HeuristicPolicy implements Policy {
       });
     }
 
-    const mapAwareDecision = chooseMapAwareExplorationAction(state, input.recentActions ?? [], sameCoordRepeats);
+    const mapKnowledge = input.mapKnowledge ?? state.mapKnowledge ?? mapKnowledgeFromRecent({
+      state,
+      recentStates: input.recentStates,
+      recentActions: input.recentActions,
+      step: input.step
+    }).summarize();
+    const mapAwareDecision = chooseMapAwareExplorationAction(state, input.recentActions ?? [], sameCoordRepeats, mapKnowledge);
     if (mapAwareDecision !== undefined) {
       return validateDecision({
         action: mapAwareDecision.action,
@@ -617,7 +625,8 @@ function normalizeFacingDirection(value: unknown): PlayerFacingDirection | undef
 function chooseMapAwareExplorationAction(
   state: PokemonStateSnapshot,
   recentActions: readonly unknown[],
-  sameCoordRepeats: number
+  sameCoordRepeats: number,
+  mapKnowledge?: MapKnowledgeSummary
 ): Pick<PolicyDecision, "action" | "rationale"> | undefined {
   const mapStructure = state.mapStructure;
   if (mapStructure === undefined || sameCoordRepeats < MAP_AWARE_REPEATED_STATE_THRESHOLD || isTextOrMenuActive(state)) {
@@ -632,7 +641,10 @@ function chooseMapAwareExplorationAction(
   const recentlyFailedButtons = sameCoordRepeats >= WALL_COLLISION_REPEATED_STATE_THRESHOLD
     ? recentDirectionalButtons(recentActions, Math.min(sameCoordRepeats + 2, 8))
     : new Set<MgbaButton>();
-  const unblockedCandidates = candidates.filter((candidate) => !recentlyFailedButtons.has(directionToButton(candidate.direction)));
+  const learnedBlockedDirections = blockedDirectionsFromKnowledge(mapKnowledge);
+  const unblockedCandidates = candidates.filter((candidate) =>
+    !recentlyFailedButtons.has(directionToButton(candidate.direction)) && !learnedBlockedDirections.has(candidate.direction)
+  );
   if (unblockedCandidates.length === 0 && recentlyFailedButtons.size > 0) {
     const probeButton = EXPLORATORY_BUTTONS.find((button) => !recentlyFailedButtons.has(button));
     if (probeButton !== undefined) {
@@ -653,7 +665,7 @@ function chooseMapAwareExplorationAction(
   }
 
   const scoredCandidates = (unblockedCandidates.length > 0 ? unblockedCandidates : candidates)
-    .map((candidate) => ({ candidate, score: scoreMapCandidate(candidate, mapStructure, recentlyFailedButtons) }))
+    .map((candidate) => ({ candidate, score: scoreMapCandidate(candidate, mapStructure, recentlyFailedButtons, mapKnowledge) }))
     .sort((left, right) => right.score - left.score || directionPriority(left.candidate.direction) - directionPriority(right.candidate.direction));
   const best = scoredCandidates[0];
   if (best === undefined || best.score < 0) {
@@ -665,14 +677,16 @@ function chooseMapAwareExplorationAction(
     action: hold(button),
     rationale:
       `Map RAM shows ${mapStructure.width}x${mapStructure.height} block map with current block ${formatBlockId(mapStructure.currentBlockId)}; ` +
-      `choose ${button} toward block ${formatBlockId(best.candidate.blockId)} at ${best.candidate.targetY},${best.candidate.targetX} while avoiding recent blocked directions.`
+      `choose ${button} toward block ${formatBlockId(best.candidate.blockId)} at ${best.candidate.targetY},${best.candidate.targetX} while avoiding recent/learned blocked directions; ` +
+      `learned map has ${mapKnowledge?.totals.visitedTiles ?? 0} visited tiles, ${mapKnowledge?.totals.frontierTiles ?? 0} frontier tiles, and ${mapKnowledge?.totals.blockedEdges ?? 0} blocked edges.`
   };
 }
 
 function scoreMapCandidate(
   candidate: PokemonMapDirectionCandidate,
   mapStructure: PokemonMapStructure,
-  recentlyFailedButtons: ReadonlySet<MgbaButton>
+  recentlyFailedButtons: ReadonlySet<MgbaButton>,
+  mapKnowledge?: MapKnowledgeSummary
 ): number {
   let score = 0;
   if (candidate.inBounds) {
@@ -687,7 +701,35 @@ function scoreMapCandidate(
   if (recentlyFailedButtons.has(directionToButton(candidate.direction))) {
     score -= 100;
   }
+  const learnedStatus = learnedCandidateStatus(mapKnowledge, candidate);
+  if (learnedStatus === "frontier") {
+    score += 6;
+  } else if (learnedStatus === "visited") {
+    score -= 3;
+  }
+  if (blockedDirectionsFromKnowledge(mapKnowledge).has(candidate.direction)) {
+    score -= 100;
+  }
   return score;
+}
+
+function blockedDirectionsFromKnowledge(mapKnowledge: MapKnowledgeSummary | undefined): ReadonlySet<PlayerFacingDirection> {
+  return new Set((mapKnowledge?.localEdges ?? [])
+    .filter((edge) => edge.status === "blocked")
+    .map((edge) => edge.direction));
+}
+
+function learnedCandidateStatus(
+  mapKnowledge: MapKnowledgeSummary | undefined,
+  candidate: PokemonMapDirectionCandidate
+): "visited" | "frontier" | undefined {
+  if (mapKnowledge === undefined) return undefined;
+  const targetKey = `${mapKnowledge.current?.mapId}:${candidate.targetY}:${candidate.targetX}`;
+  if (mapKnowledge.currentTile !== undefined && `${mapKnowledge.currentTile.mapId}:${mapKnowledge.currentTile.y}:${mapKnowledge.currentTile.x}` === targetKey) {
+    return mapKnowledge.currentTile.status;
+  }
+  if (mapKnowledge.localFrontierTiles.some((tile) => `${tile.mapId}:${tile.y}:${tile.x}` === targetKey)) return "frontier";
+  return mapKnowledge.localEdges.some((edge) => edge.to === targetKey && edge.status === "walkable") ? "visited" : undefined;
 }
 
 function recentDirectionalButtons(recentActions: readonly unknown[], limit: number): ReadonlySet<MgbaButton> {

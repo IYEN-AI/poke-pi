@@ -181,7 +181,7 @@ The lower-level equivalent remains available when you do not want the HTTP contr
 npm run harness -- map-heuristic --with-dashboard --mode stage1 --max-steps 100 --run-id map-1
 ```
 
-The map-aware heuristic reads Red/Blue WRAM map structure (`wOverworldMap`, current map width/height, current block coordinates, and neighboring direction candidates). It explores with directional inputs first and only presses `A` in normal overworld movement when the tile/block in front is treated as an interaction candidate. Text boxes, menus, and battles still use prompt/battle-specific controls.
+The map-aware heuristic reads Red/Blue WRAM map structure (`wOverworldMap`, current map width/height, current block coordinates, and neighboring direction candidates). It now also builds learned map knowledge from live movement outcomes: every directional action can mark an edge as `walkable`, `blocked`, or `transition`, and actual `wCurMap` changes are recorded as map transitions with source/target fingerprints instead of being merged into one coordinate system. It explores with directional inputs first and only presses `A` in normal overworld movement when the tile/block in front is treated as an interaction candidate. Text boxes, menus, and battles gate map learning off so UI screens are not mistaken for geometry.
 
 ### Scout → synthesize → execute loop
 
@@ -194,7 +194,7 @@ npm run poke -- play-policy --policy-file policies/generated/pallet-v1.json --ma
 npm run poke -- llm --policy-file policies/generated/pallet-v1.json --max-steps 100 --run-id llm-guided-1
 ```
 
-Scout runs collect map/action/outcome telemetry cheaply; Hermes can synthesize a JSON policy from those logs; the harness validates and executes that policy; then the same policy file can be passed to `llm` as a guide. In guided LLM mode, the generated policy produces a recommended decision first; the LLM sees that recommendation plus current RAM/recent action evidence and may follow it or override it with an observed-state rationale.
+Scout runs collect map/action/outcome telemetry cheaply; Hermes can synthesize a JSON policy from those logs; the harness validates and executes that policy; then the same policy file can be passed to `llm` as a guide. In guided LLM mode, the generated policy produces a recommended decision first; the LLM sees that recommendation plus current RAM/recent action evidence and the learned `mapKnowledge` summary, including known maps, frontier tiles, blocked edges, and recent map transitions. The LLM may follow the guide or override it with an observed-state rationale, but learned movement facts remain grounded in RAM/action outcomes.
 
 ### Background strategy loop
 
@@ -264,7 +264,7 @@ The dashboard UI includes:
 - **Control server**: enter `runId`, `maxSteps`, and mode, then start `Play heuristic` or `LLM run`, stop the active child harness, or clean failed runs. The dashboard intentionally does not expose manual game input; gameplay is agent-only.
 - **mGBA screen**: live screenshot stream from mGBA-http, with latest evidence screenshot fallback when mGBA screenshot capture fails.
 - **Map structure**: current map dimensions, tileset, block row/column/id, direction candidates, and visible blocks read from Red/Blue WRAM.
-- **Harness telemetry**: recent run summary, last LLM decision, last button action, route context, map/x/y/facing, battle HP, screen text, selected action, confidence, checkpoint progress, repeated-state signals, and fallback/low-confidence markers.
+- **Harness telemetry**: recent run summary, last LLM decision, last button action, route context, map/x/y/facing, battle HP, screen text, selected action, confidence, checkpoint progress, repeated-state signals, fallback/low-confidence markers, learned map-knowledge totals, local blocked/walkable edges, and recent map transitions.
 
 Start the Stage 1 harness loop with the local heuristic policy:
 

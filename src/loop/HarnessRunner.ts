@@ -2,6 +2,7 @@ import type { HarnessConfig } from "../config.js";
 import type { Policy, PolicyInput, PokemonStateSnapshot, RecentStateSnapshot } from "../ai/Policy.js";
 import type { PolicyDecision } from "../control/ActionTypes.js";
 import type { ScreenshotMetadata } from "../evidence/EvidenceRecorder.js";
+import { MapKnowledgeTracker } from "../pokemon/MapKnowledge.js";
 import { HarnessError, type SerializedHarnessError } from "../errors.js";
 import type { DetectorStatus, ProgressDetector } from "../pokemon/Detector.js";
 import type { FrameNumber, HarnessErrorCode, HarnessStatus, RunId } from "../types.js";
@@ -109,6 +110,7 @@ export class HarnessRunner<TState = PokemonStateSnapshot> {
   private readonly recentStates: RecentStateSnapshot[] = [];
   private readonly recentStateHashes: string[] = [];
   private readonly last20Actions: RecordedActionSummary[] = [];
+  private readonly mapKnowledge = new MapKnowledgeTracker();
   private startedAt: string | undefined;
   private step = 0;
   private llmCalls = 0;
@@ -227,12 +229,14 @@ export class HarnessRunner<TState = PokemonStateSnapshot> {
       currentState: snapshot.state,
       recentStates: [...this.recentStates],
       recentActions: [...this.last20Actions],
-      step: this.step
+      step: this.step,
+      mapKnowledge: this.mapKnowledge.summarize()
     };
   }
 
   private recordRecentState(snapshot: HarnessSnapshot<TState>): void {
     const state = toPolicyState(snapshot.state) as RecentStateSnapshot;
+    this.mapKnowledge.observeTransition(this.recentStates.at(-1), this.last20Actions.at(-1), state, this.step);
     this.recentStates.push({ ...state, step: this.step });
     this.recentStateHashes.push(snapshot.stateHash);
     trimToLimit(this.recentStates, RECENT_LIMIT);
@@ -277,7 +281,8 @@ export class HarnessRunner<TState = PokemonStateSnapshot> {
       recentStateHashes: this.recentStateHashes,
       repeatedStateThreshold: this.repeatedStateThreshold,
       llmCalls: this.llmCalls,
-      maxLlmCalls: this.maxLlmCalls
+      maxLlmCalls: this.maxLlmCalls,
+      mapKnowledge: this.mapKnowledge.summarize()
     }));
   }
 
@@ -358,6 +363,7 @@ interface PokemonTelemetryInput<TState> {
   readonly repeatedStateThreshold: number;
   readonly llmCalls: number;
   readonly maxLlmCalls: number;
+  readonly mapKnowledge?: unknown;
 }
 
 function createPokemonTelemetry<TState>(input: PokemonTelemetryInput<TState>): unknown {
@@ -424,6 +430,7 @@ function createPokemonTelemetry<TState>(input: PokemonTelemetryInput<TState>): u
       lowConfidence: input.decision.confidence < 0.45,
       fallback: input.decision.rationale.includes("LLM fallback after") || input.decision.observedStateCitations.some((citation) => citation.includes("LLM fallback after"))
     },
+    mapKnowledge: input.mapKnowledge,
     progress: {
       status: input.detectorAfter.status,
       checkpoints: input.detectorAfter.checkpoints,
