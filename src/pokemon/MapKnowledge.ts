@@ -334,7 +334,7 @@ function isMappableOverworld(state: PokemonStateSnapshot): boolean {
   const textBoxId = state.wTextBoxID ?? state.textBoxId ?? 0;
   const screenTextKind = typeof state.screenTextKind === "string" ? state.screenTextKind : "none";
   const screenText = typeof state.screenText === "string" ? state.screenText.trim() : "";
-  return !battle && screenTextKind !== "oak_intro" && screenTextKind !== "default_name_menu" && screenTextKind !== "naming_screen" && screenText.length === 0 && textBoxId === 0;
+  return !battle && screenTextKind !== "oak_intro" && screenTextKind !== "default_name_menu" && screenTextKind !== "naming_screen" && screenText.length === 0;
 }
 
 function getLocation(state: PokemonStateSnapshot): { mapId: number; y: number; x: number } | undefined {
