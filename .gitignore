@@ -1,0 +1,16 @@
+.env
+.env.*
+!.env.example
+.omo/
+.playwright-mcp/
+runs/
+node_modules/
+.local-tools/
+dist/
+coverage/
+*.gb
+*.gbc
+*.gba
+*.sav
+*.state
+*.png
