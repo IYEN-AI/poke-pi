@@ -38,7 +38,7 @@ export const HarnessActionSchema: z.ZodType<HarnessAction> = z.lazy(() =>
     WaitActionSchema,
     z.strictObject({
       type: z.literal("sequence"),
-      actions: z.array(HarnessActionSchema).max(8)
+      actions: z.array(HarnessActionSchema).max(24)
     })
   ])
 ).superRefine((action, context) => {

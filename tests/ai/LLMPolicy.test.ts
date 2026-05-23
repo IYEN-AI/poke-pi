@@ -1,3 +1,6 @@
+import { mkdtemp, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { loadConfig } from "../../src/config.js";
 import type { PolicyDecision } from "../../src/control/ActionTypes.js";
@@ -48,6 +51,8 @@ describe("LLMPolicy", () => {
     expect(requests[0]?.messages[0]?.role).toBe("system");
     expect(requests[0]?.messages[1]?.content).toContain("Current RAM-derived state JSON");
     expect(requests[0]?.messages[1]?.content).toContain("Stage 1 objective");
+    expect(requests[0]?.messages[1]?.content).toContain("Macro-route preference");
+    expect(requests[0]?.messages[1]?.content).toContain("sequence may contain up to 24 child actions");
     expect(requests[0]?.messages[1]?.content).toContain("Stage 1 route facts");
     expect(requests[0]?.messages[1]?.content).toContain("Anti-hardcoding rule");
     expect(requests[0]?.messages[1]?.content).toContain("Output only one JSON object");
@@ -110,6 +115,31 @@ describe("LLMPolicy", () => {
     expect(prompt).toContain("Do not claim route facts alone, Rival battle exit, or all badges as full-game completion");
     expect(prompt).not.toContain("Stage 1 route facts");
   });
+
+  it("attaches the current screenshot as a vision input when available", async () => {
+    const requests: ChatCompletionRequest[] = [];
+    const dir = await mkdtemp(join(tmpdir(), "poke-llm-vision-"));
+    const screenshotPath = join(dir, "screen.png");
+    await writeFile(screenshotPath, Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+    const client = fakeClient(async (request) => {
+      requests.push(request);
+      return JSON.stringify(validDecision);
+    });
+    const policy = createPolicy({ client });
+
+    await expect(policy.chooseAction({
+      ...policyInput,
+      visualObservation: { screenshot: { path: screenshotPath, frame: 1, step: 1, note: "unit" } }
+    })).resolves.toEqual(validDecision);
+
+    const content = requests[0]?.messages[1]?.content;
+    expect(Array.isArray(content)).toBe(true);
+    expect(content).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "text", text: expect.stringContaining("Current screenshot is attached") }),
+      expect.objectContaining({ type: "image_url", image_url: { url: expect.stringContaining("data:image/png;base64,") } })
+    ]));
+  });
+
 
   it("injects a generated-policy guide decision into the LLM prompt", async () => {
     const requests: ChatCompletionRequest[] = [];

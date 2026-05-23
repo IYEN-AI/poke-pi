@@ -238,7 +238,8 @@ export class HarnessRunner<TState = PokemonStateSnapshot> {
       recentActions: [...this.last20Actions],
       step: this.step,
       mapKnowledge: this.mapKnowledge.summarize(),
-      recentPostActionObservations: [...this.recentPostActionObservations]
+      recentPostActionObservations: [...this.recentPostActionObservations],
+      visualObservation: { screenshot: snapshot.screenshot }
     };
   }
 

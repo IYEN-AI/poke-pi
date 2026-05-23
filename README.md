@@ -194,7 +194,7 @@ npm run poke -- play-policy --policy-file policies/generated/pallet-v1.json --ma
 npm run poke -- llm --policy-file policies/generated/pallet-v1.json --max-steps 100 --run-id llm-guided-1
 ```
 
-Scout runs collect map/action/outcome telemetry cheaply; Hermes can synthesize a JSON policy from those logs; the harness validates and executes that policy; then the same policy file can be passed to `llm` as a guide. In guided LLM mode, the generated policy produces a recommended decision first; the LLM sees that recommendation plus current RAM/recent action evidence, short-cycle `recentPostActionObservations` with `change.kind`/delta, and the learned `mapKnowledge` summary, including known maps, frontier tiles, blocked edges, and recent map transitions. The LLM may follow the guide or override it with an observed-state rationale, but learned movement facts remain grounded in RAM/action outcomes.
+Scout runs collect map/action/outcome telemetry cheaply; Hermes can synthesize a JSON policy from those logs; the harness validates and executes that policy; then the same policy file can be passed to `llm` as a guide. In guided LLM mode, the generated policy produces a recommended decision first; the LLM sees that recommendation plus current RAM/recent action evidence, the current screenshot when available, short-cycle `recentPostActionObservations` with `change.kind`/delta, and the learned `mapKnowledge` summary, including known maps, frontier tiles, blocked edges, and recent map transitions. For stable overworld movement it is prompted to output a bounded macro-route `sequence` rather than one button at a time. The LLM may follow the guide or override it with an observed-state rationale, but learned movement facts remain grounded in RAM/action outcomes.
 
 ### Background strategy loop
 
@@ -264,7 +264,7 @@ The dashboard UI includes:
 - **Control server**: enter `runId`, `maxSteps`, and mode, then start `Play heuristic` or `LLM run`, stop the active child harness, or clean failed runs. The dashboard intentionally does not expose manual game input; gameplay is agent-only.
 - **mGBA screen**: live screenshot stream from mGBA-http, with latest evidence screenshot fallback when mGBA screenshot capture fails.
 - **Map structure**: current map dimensions, tileset, block row/column/id, direction candidates, and visible blocks read from Red/Blue WRAM.
-- **Harness telemetry**: recent run summary, last LLM decision, last button action, route context, map/x/y/facing, battle HP, screen text, selected action, confidence, checkpoint progress, repeated-state signals, fallback/low-confidence markers, learned map-knowledge totals, local blocked/walkable edges, recent map transitions, and short-cycle post-action RAM/pixel-change probes with classified transition kinds for LLM map-identity judgment.
+- **Harness telemetry**: recent run summary, last LLM decision, last button action, route context, map/x/y/facing, battle HP, screen text, selected action, confidence, checkpoint progress, repeated-state signals, fallback/low-confidence markers, learned map-knowledge totals, local blocked/walkable edges, recent map transitions, and current screenshot attachment for vision-capable LLMs, bounded macro-route sequences, and short-cycle post-action RAM/pixel-change probes with classified transition kinds for LLM map-identity judgment.
 
 Start the Stage 1 harness loop with the local heuristic policy:
 

@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises";
 import OpenAI from "openai";
 import type { HarnessConfig, HarnessMode } from "../config.js";
 import type { PolicyDecision } from "../control/ActionTypes.js";
@@ -25,10 +26,12 @@ export interface ChatCompletionsClient {
   };
 }
 
+export type ChatMessageContent = string | Array<{ type: "text"; text: string } | { type: "image_url"; image_url: { url: string } }>;
+
 export interface ChatCompletionRequest {
   model: string;
   temperature?: number;
-  messages: Array<{ role: "system" | "user"; content: string }>;
+  messages: Array<{ role: "system" | "user"; content: any }>;
 }
 
 export interface OpenAIClientOptions {
@@ -120,10 +123,11 @@ export class LLMPolicy implements Policy {
 
     try {
       const guide = await this.buildGuide(input);
+      const messages = await buildMessages(input, this.harnessMode, guide);
       const completion = await this.client.chat.completions.create(buildChatCompletionRequest({
         model: this.model,
         temperature: this.temperature,
-        messages: buildMessages(input, this.harnessMode, guide)
+        messages
       }));
       const content = completion.choices[0]?.message?.content;
 
@@ -211,15 +215,15 @@ function markFallbackDecision(decision: PolicyDecision, code: string): PolicyDec
 }
 
 function createOpenAIClient(options: OpenAIClientOptions): ChatCompletionsClient {
-  return new OpenAI(options);
+  return new OpenAI(options) as unknown as ChatCompletionsClient;
 }
 
-function buildMessages(input: PolicyInput, harnessMode: HarnessMode, guide?: LLMGuideContext): ChatCompletionRequest["messages"] {
+async function buildMessages(input: PolicyInput, harnessMode: HarnessMode, guide?: LLMGuideContext): Promise<ChatCompletionRequest["messages"]> {
   if (harnessMode === "full-game") {
     return buildFullGameMessages(input, guide);
   }
 
-  return [
+  const messages: ChatCompletionRequest["messages"] = [
     {
       role: "system",
       content: "You are a bounded Pokemon Red/Blue controller. Choose only safe Game Boy actions from the supplied schema. Never invent buttons, memory writes, shell commands, code execution, or a hardcoded global input timeline."
@@ -229,21 +233,25 @@ function buildMessages(input: PolicyInput, harnessMode: HarnessMode, guide?: LLM
       content: [
         "Role: Pokemon Red/Blue controller for an mGBA harness.",
         "Stage 1 objective: progress from the Pallet start through Oak/starter flow, starter acquisition, Rival battle entry, and Rival battle exit using only current observed state.",
+        macroRouteGuidance(),
         `Current RAM-derived state JSON: ${stableJson(stateWithMapKnowledge(input))}`,
         `Recent actions summary: ${stableJson(input.recentActions ?? input.recentStates ?? [])}`,
         stage1RouteFacts(),
         guidePromptSection(guide),
         `Allowed action schema: ${stableJson(createPolicyDecisionJsonSchema())}`,
+        sequenceGuidance(),
         "Anti-hardcoding rule: base each decision on the current state and recent action results only; do not follow or emit a precomputed global input timeline.",
         "Generated-policy guide rule: when a generated policy guide is supplied, treat it as Hermes' current bounded heuristic recommendation. Follow it when it fits the current observation; if you override it, explain the observed-state reason in rationale.",
         "Output only one JSON object matching the allowed policy decision schema. Do not include markdown, comments, or extra text."
       ].join("\n")
     }
   ];
+
+  return withVisualObservation(messages, input);
 }
 
-function buildFullGameMessages(input: PolicyInput, guide?: LLMGuideContext): ChatCompletionRequest["messages"] {
-  return [
+async function buildFullGameMessages(input: PolicyInput, guide?: LLMGuideContext): Promise<ChatCompletionRequest["messages"]> {
+  const messages: ChatCompletionRequest["messages"] = [
     {
       role: "system",
       content: "You are a Pokemon Red/Blue full-game controller for an mGBA harness. Choose only safe Game Boy actions from the supplied schema. Never invent buttons, memory writes, emulator RAM mutation, shell commands, code execution, ROM assets, walkthrough text, or a hardcoded global input timeline."
@@ -253,6 +261,7 @@ function buildFullGameMessages(input: PolicyInput, guide?: LLMGuideContext): Cha
       content: [
         "Role: Pokemon Red/Blue controller for an mGBA harness.",
         "Full-game objective: progress through the game using only current observed state and safe controller inputs.",
+        macroRouteGuidance(),
         "Final detector goal: completion can be claimed only when the current observed map is Hall of Fame (map id 0x76) or hallOfFameComplete is true.",
         "Badges are read-only progress signals only; wObtainedBadges, badgeCount, and badgesObtained are not completion by themselves.",
         "Do not request or imply memory writes, emulator RAM mutation APIs, ROM-derived assets, map graphics, walkthrough text, or precomputed global input timelines.",
@@ -261,12 +270,60 @@ function buildFullGameMessages(input: PolicyInput, guide?: LLMGuideContext): Cha
         `Recent actions summary: ${stableJson(input.recentActions ?? input.recentStates ?? [])}`,
         guidePromptSection(guide),
         `Allowed action schema: ${stableJson(createPolicyDecisionJsonSchema())}`,
+        sequenceGuidance(),
         "Anti-hardcoding rule: base each decision on the current state and recent action results only; do not follow or emit a precomputed global input timeline.",
         "Generated-policy guide rule: when a generated policy guide is supplied, treat it as Hermes' current bounded heuristic recommendation. Follow it when it fits the current observation; if you override it, explain the observed-state reason in rationale.",
         "Output only one JSON object matching the allowed policy decision schema. Do not include markdown, comments, or extra text."
       ].join("\n")
     }
   ];
+
+  return withVisualObservation(messages, input);
+}
+
+async function withVisualObservation(messages: ChatCompletionRequest["messages"], input: PolicyInput): Promise<ChatCompletionRequest["messages"]> {
+  const screenshotPath = input.visualObservation?.screenshot?.path;
+  if (screenshotPath === undefined) {
+    return messages;
+  }
+
+  const dataUrl = await screenshotDataUrl(screenshotPath);
+  if (dataUrl === undefined) {
+    return messages;
+  }
+
+  const [system, user] = messages;
+  if (system === undefined || user === undefined || typeof user.content !== "string") {
+    return messages;
+  }
+
+  return [
+    system,
+    {
+      role: "user",
+      content: [
+        { type: "text", text: `${user.content}\nCurrent screenshot is attached. Use it as a visual local-map prior, but trust RAM/action probes for verified movement facts.` },
+        { type: "image_url", image_url: { url: dataUrl } }
+      ]
+    }
+  ];
+}
+
+async function screenshotDataUrl(path: string): Promise<string | undefined> {
+  try {
+    const data = await readFile(path);
+    return `data:image/png;base64,${data.toString("base64")}`;
+  } catch {
+    return undefined;
+  }
+}
+
+function macroRouteGuidance(): string {
+  return "Macro-route preference: when the current state is stable overworld movement, use the screenshot plus RAM/probe evidence to output a bounded sequence of 4-16 local movement actions rather than a single button. Use shorter/single actions for battle, text, menus, uncertain transitions, or low confidence.";
+}
+
+function sequenceGuidance(): string {
+  return "Sequence guidance: a sequence may contain up to 24 child actions. Prefer holds for walking steps. Keep each macro local and reversible; do not emit a global walkthrough timeline.";
 }
 
 function stateWithMapKnowledge(input: PolicyInput): unknown {
