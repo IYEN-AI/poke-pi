@@ -96,7 +96,7 @@ export class HeuristicPolicy implements Policy {
       });
     }
 
-    const postStarterRouteOneNavigation = choosePostStarterRouteOneNavigationAction(state);
+    const postStarterRouteOneNavigation = choosePostStarterRouteOneNavigationAction(state, sameCoordRepeats, input.recentActions ?? []);
     if (postStarterRouteOneNavigation !== undefined) {
       return validateDecision({
         action: postStarterRouteOneNavigation.action,
@@ -454,7 +454,9 @@ function chooseHomeNavigationAction(
 }
 
 function choosePostStarterRouteOneNavigationAction(
-  state: PokemonStateSnapshot
+  state: PokemonStateSnapshot,
+  sameCoordRepeats: number,
+  recentActions: readonly unknown[]
 ): Pick<PolicyDecision, "action" | "rationale"> | undefined {
   if (getPartyCount(state) === 0 || state.wCurMap !== 12 || state.wYCoord === undefined || state.wXCoord === undefined) {
     return undefined;
@@ -467,16 +469,20 @@ function choosePostStarterRouteOneNavigationAction(
   }
 
   return {
-    action: hold(chooseRouteOneStep(state.wYCoord, state.wXCoord)),
+    action: hold(chooseRouteOneStep(state.wYCoord, state.wXCoord, sameCoordRepeats, recentActions)),
     rationale:
       "Player is on Route 1 after starter acquisition with only stale empty text flags, so continue northward route exploration instead of waiting for repeated coordinates."
   };
 }
 
-function chooseRouteOneStep(y: number, x: number): MgbaButton {
+function chooseRouteOneStep(y: number, x: number, sameCoordRepeats: number, recentActions: readonly unknown[]): MgbaButton {
+  const recentButtons = recentDirectionalButtons(recentActions, 4);
   if (x > 10) return "Left";
   if (x < 10) return "Right";
-  return y > 0 ? "Up" : "Up";
+  if (sameCoordRepeats >= WALL_COLLISION_REPEATED_STATE_THRESHOLD && recentButtons.has("Up")) {
+    return y % 2 === 0 ? "Right" : "Left";
+  }
+  return "Up";
 }
 
 function choosePostStarterOverworldNavigationAction(
