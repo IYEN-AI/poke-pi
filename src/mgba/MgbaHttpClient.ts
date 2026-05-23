@@ -1,3 +1,5 @@
+import { mkdir, rm, stat, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { HarnessError } from "../errors.js";
@@ -11,27 +13,34 @@ export interface MgbaHttpClientOptions {
   fetchImpl?: MgbaFetch;
   screenshotDir?: string;
   timeoutMs?: number;
+  requestLockDir?: string;
 }
 
 const DEFAULT_TAP_FRAMES = 5;
-const DEFAULT_TIMEOUT_MS = 5_000;
+const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_SCREENSHOT_DIR = dirname(fileURLToPath(import.meta.url));
+const DEFAULT_REQUEST_LOCK_DIR = join(tmpdir(), "poke-pi-mgba-http.lock");
+const REQUEST_LOCK_STALE_MS = 60_000;
+const REQUEST_LOCK_RETRY_MS = 25;
 
 export class MgbaHttpClient {
   private readonly baseUrl: URL;
   private readonly fetchImpl: MgbaFetch;
   private readonly screenshotDir: string;
   private readonly timeoutMs: number;
+  private readonly requestLockDir: string;
+  private requestQueue: Promise<void> = Promise.resolve();
 
   constructor(options: MgbaHttpClientOptions) {
     this.baseUrl = new URL(options.baseUrl);
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.screenshotDir = options.screenshotDir ?? DEFAULT_SCREENSHOT_DIR;
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    this.requestLockDir = options.requestLockDir ?? DEFAULT_REQUEST_LOCK_DIR;
   }
 
   async currentFrame(): Promise<FrameNumber> {
-    return this.requestNumber("GET", "/core/currentframe");
+    return this.requestNumber("GET", "/core/currentFrame");
   }
 
   async read8(address: number): Promise<number> {
@@ -96,7 +105,25 @@ export class MgbaHttpClient {
     return parsed;
   }
 
-  private async requestText(
+  private requestText(
+    method: "GET" | "POST",
+    path: string,
+    query: Record<string, string> = {},
+    errorCode: HarnessErrorCode = "MGBA_UNAVAILABLE"
+  ): Promise<string> {
+    return this.enqueueRequest(() => this.performRequestText(method, path, query, errorCode));
+  }
+
+  private async enqueueRequest<T>(operation: () => Promise<T>): Promise<T> {
+    const run = this.requestQueue.then(operation, operation);
+    this.requestQueue = run.then(
+      () => undefined,
+      () => undefined
+    );
+    return run;
+  }
+
+  private async performRequestText(
     method: "GET" | "POST",
     path: string,
     query: Record<string, string> = {},
@@ -105,18 +132,23 @@ export class MgbaHttpClient {
     const url = this.buildUrl(path, query);
 
     try {
-      const response = await this.fetchImpl(url, {
-        method,
-        signal: createTimeoutSignal(this.timeoutMs)
-      });
-
-      if (!response.ok) {
-        throw new HarnessError(errorCode, "mGBA-http request failed", {
-          context: { endpoint: path, status: response.status, statusText: response.statusText }
+      const releaseLock = await this.acquireRequestLock();
+      try {
+        const response = await this.fetchImpl(url, {
+          method,
+          signal: createTimeoutSignal(this.timeoutMs)
         });
-      }
 
-      return await response.text();
+        if (!response.ok) {
+          throw new HarnessError(errorCode, "mGBA-http request failed", {
+            context: { endpoint: path, status: response.status, statusText: response.statusText }
+          });
+        }
+
+        return await response.text();
+      } finally {
+        await releaseLock();
+      }
     } catch (error) {
       if (error instanceof HarnessError) {
         throw error;
@@ -126,6 +158,25 @@ export class MgbaHttpClient {
         cause: error,
         context: { endpoint: path }
       });
+    }
+  }
+
+  private async acquireRequestLock(): Promise<() => Promise<void>> {
+    while (true) {
+      try {
+        await mkdir(this.requestLockDir);
+        await writeFile(join(this.requestLockDir, "owner"), `${process.pid} ${Date.now()}\n`, "utf8");
+        return async () => {
+          await rm(this.requestLockDir, { force: true, recursive: true });
+        };
+      } catch (error) {
+        if (!isAlreadyExistsError(error)) {
+          throw error;
+        }
+
+        await removeStaleLock(this.requestLockDir);
+        await sleep(REQUEST_LOCK_RETRY_MS);
+      }
     }
   }
 
@@ -224,4 +275,33 @@ function createTimeoutSignal(timeoutMs: number): AbortSignal | undefined {
   }
 
   return AbortSignal.timeout(timeoutMs);
+}
+
+async function removeStaleLock(lockDir: string): Promise<void> {
+  try {
+    const stats = await stat(lockDir);
+    if (Date.now() - stats.mtimeMs > REQUEST_LOCK_STALE_MS) {
+      await rm(lockDir, { force: true, recursive: true });
+    }
+  } catch (error) {
+    if (!isNotFoundError(error)) {
+      throw error;
+    }
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isAlreadyExistsError(error: unknown): boolean {
+  return isNodeError(error) && error.code === "EEXIST";
+}
+
+function isNotFoundError(error: unknown): boolean {
+  return isNodeError(error) && error.code === "ENOENT";
+}
+
+function isNodeError(error: unknown): error is NodeJS.ErrnoException {
+  return error instanceof Error && "code" in error;
 }

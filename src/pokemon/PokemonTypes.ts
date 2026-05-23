@@ -50,6 +50,30 @@ export interface MenuTextState {
 
 export type ScreenTextKind = "none" | "oak_intro" | "default_name_menu" | "naming_screen" | "overworld_text";
 
+export interface PokemonMapDirectionCandidate {
+  direction: PlayerFacingDirection;
+  targetY: number;
+  targetX: number;
+  targetBlockRow: number;
+  targetBlockCol: number;
+  blockId?: number;
+  inBounds: boolean;
+}
+
+export interface PokemonMapStructure {
+  mapId: number;
+  width: number;
+  height: number;
+  stride: number;
+  tileset: number;
+  currentViewPointer: number;
+  currentBlockRow: number;
+  currentBlockCol: number;
+  currentBlockId?: number;
+  visibleBlocks: readonly (readonly number[])[];
+  directionCandidates: readonly PokemonMapDirectionCandidate[];
+}
+
 export interface PokemonGameState {
   battle: BattleFlag;
   coordinates: PokemonCoordinates;
@@ -57,4 +81,5 @@ export interface PokemonGameState {
   party: PartySummary;
   badges: BadgeProgress;
   menuText: MenuTextState;
+  mapStructure?: PokemonMapStructure;
 }

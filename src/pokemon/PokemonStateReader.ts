@@ -9,7 +9,7 @@ import {
   decodeUnsignedByte
 } from "./decoders.js";
 import { HALL_OF_FAME_MAP_ID, RED_BLUE_MEMORY_MAP } from "./memoryMap.js";
-import type { BadgeProgress, BattleFlag, HitPoints, MenuTextState, PartySummary, PlayerFacing, PokemonCoordinates, PokemonGameState } from "./PokemonTypes.js";
+import type { BadgeProgress, BattleFlag, HitPoints, MenuTextState, PartySummary, PlayerFacing, PlayerFacingDirection, PokemonCoordinates, PokemonGameState, PokemonMapDirectionCandidate, PokemonMapStructure } from "./PokemonTypes.js";
 
 type RamClient = Pick<MgbaHttpClient, "read8" | "read16" | "readRange">;
 
@@ -64,9 +64,77 @@ export interface PokemonGameStateSnapshot extends PokemonGameState {
   readonly menuItem: number;
   readonly textBoxId: number;
   readonly letterDelayFlags: number;
+  readonly mapStructure?: PokemonMapStructure;
 }
 
 const map = RED_BLUE_MEMORY_MAP;
+
+const MAP_BORDER = 3;
+const SCREEN_BLOCK_WIDTH = 6;
+const SCREEN_BLOCK_HEIGHT = 5;
+
+function littleEndianWord(lowByte: number, highByte: number): number {
+  return lowByte | (highByte << 8);
+}
+
+function isUsableMapDimension(value: number): boolean {
+  return Number.isInteger(value) && value > 0 && value <= 100;
+}
+
+function readVisibleBlocks(overworldMap: Uint8Array, currentViewPointer: number, stride: number): readonly (readonly number[])[] {
+  const viewOffset = currentViewPointer - map.wOverworldMap;
+  if (viewOffset < 0 || viewOffset >= overworldMap.length) {
+    return [];
+  }
+
+  return Array.from({ length: SCREEN_BLOCK_HEIGHT }, (_rowValue, row) => (
+    Array.from({ length: SCREEN_BLOCK_WIDTH }, (_colValue, col) => overworldMap[viewOffset + row * stride + col] ?? 0)
+  ));
+}
+
+function buildDirectionCandidates(input: {
+  overworldMap: Uint8Array;
+  stride: number;
+  width: number;
+  height: number;
+  y: number;
+  x: number;
+}): readonly PokemonMapDirectionCandidate[] {
+  return [
+    buildDirectionCandidate(input, "up", -1, 0),
+    buildDirectionCandidate(input, "right", 0, 1),
+    buildDirectionCandidate(input, "down", 1, 0),
+    buildDirectionCandidate(input, "left", 0, -1)
+  ];
+}
+
+function buildDirectionCandidate(
+  input: { overworldMap: Uint8Array; stride: number; width: number; height: number; y: number; x: number },
+  direction: PlayerFacingDirection,
+  deltaY: number,
+  deltaX: number
+): PokemonMapDirectionCandidate {
+  const targetY = input.y + deltaY;
+  const targetX = input.x + deltaX;
+  const inBounds = targetY >= 0 && targetX >= 0 && targetY < input.height * 2 && targetX < input.width * 2;
+  const targetBlockRow = Math.floor(targetY / 2) + MAP_BORDER;
+  const targetBlockCol = Math.floor(targetX / 2) + MAP_BORDER;
+
+  return {
+    direction,
+    targetY,
+    targetX,
+    targetBlockRow,
+    targetBlockCol,
+    blockId: blockAt(input.overworldMap, input.stride, targetBlockRow, targetBlockCol),
+    inBounds
+  };
+}
+
+function blockAt(overworldMap: Uint8Array, stride: number, row: number, col: number): number | undefined {
+  const index = row * stride + col;
+  return index >= 0 && index < overworldMap.length ? overworldMap[index] : undefined;
+}
 
 export class PokemonStateReader {
   private readonly client: RamClient;
@@ -78,16 +146,17 @@ export class PokemonStateReader {
   }
 
   async readState(): Promise<PokemonGameStateSnapshot> {
-    const [battleState, coordinates, playerFacing, party, badges, menuText] = await Promise.all([
+    const [battleState, coordinates, playerFacing, party, badges, menuText, mapStructure] = await Promise.all([
       this.readBattleState(),
       this.readOverworldState(),
       this.readPlayerFacingState(),
       this.readPartyState(),
       this.readBadgeState(),
-      this.readMenuTextState()
+      this.readMenuTextState(),
+      this.readMapStructureState()
     ]);
 
-    return createSnapshot({ battleState, coordinates, playerFacing, party, badges, menuText });
+    return createSnapshot({ battleState, coordinates, playerFacing, party, badges, menuText, mapStructure });
   }
 
   async readOverworldState(): Promise<PokemonCoordinates> {
@@ -170,6 +239,45 @@ export class PokemonStateReader {
     return decodeBadgeProgress(await this.client.read8(map.wObtainedBadges));
   }
 
+  async readMapStructureState(): Promise<PokemonMapStructure | undefined> {
+    const header = await this.readRangeExact(map.wCurMap, map.wCurMapWidth - map.wCurMap + 1, "mapStructureHeader");
+    const mapId = byteAt(header, 0, "wCurMap");
+    const currentViewPointer = littleEndianWord(
+      byteAt(header, map.wCurrentTileBlockMapViewPointer - map.wCurMap, "wCurrentTileBlockMapViewPointer.lowByte"),
+      byteAt(header, map.wCurrentTileBlockMapViewPointer - map.wCurMap + 1, "wCurrentTileBlockMapViewPointer.highByte")
+    );
+    const y = byteAt(header, map.wYCoord - map.wCurMap, "wYCoord");
+    const x = byteAt(header, map.wXCoord - map.wCurMap, "wXCoord");
+    const tileset = byteAt(header, map.wCurMapTileset - map.wCurMap, "wCurMapTileset");
+    const height = byteAt(header, map.wCurMapHeight - map.wCurMap, "wCurMapHeight");
+    const width = byteAt(header, map.wCurMapWidth - map.wCurMap, "wCurMapWidth");
+
+    if (!isUsableMapDimension(width) || !isUsableMapDimension(height)) {
+      return undefined;
+    }
+
+    const stride = width + MAP_BORDER * 2;
+    const expectedLength = Math.min(map.wOverworldMapLength, stride * (height + MAP_BORDER * 2));
+    const overworldMap = await this.readRangeExact(map.wOverworldMap, expectedLength, "wOverworldMap");
+    const currentBlockRow = Math.floor(y / 2) + MAP_BORDER;
+    const currentBlockCol = Math.floor(x / 2) + MAP_BORDER;
+    const visibleBlocks = readVisibleBlocks(overworldMap, currentViewPointer, stride);
+
+    return {
+      mapId,
+      width,
+      height,
+      stride,
+      tileset,
+      currentViewPointer,
+      currentBlockRow,
+      currentBlockCol,
+      currentBlockId: blockAt(overworldMap, stride, currentBlockRow, currentBlockCol),
+      visibleBlocks,
+      directionCandidates: buildDirectionCandidates({ overworldMap, stride, width, height, y, x })
+    };
+  }
+
   async readMenuTextState(): Promise<MenuTextState> {
     const [currentMenuItem, textBoxId, letterPrintingDelayFlags, tileMap, namingScreenNameLength, namingScreenSubmitName, namingScreenType] = await Promise.all([
       this.client.read8(map.wCurrentMenuItem),
@@ -214,8 +322,9 @@ function createSnapshot(input: {
   party: PartySummary;
   badges: BadgeProgress;
   menuText: MenuTextState;
+  mapStructure?: PokemonMapStructure;
 }): PokemonGameStateSnapshot {
-  const { battleState, coordinates, playerFacing, party, badges, menuText } = input;
+  const { battleState, coordinates, playerFacing, party, badges, menuText, mapStructure } = input;
 
   return {
     battle: battleState.flag,
@@ -258,7 +367,8 @@ function createSnapshot(input: {
     partyCount: party.count,
     menuItem: menuText.currentMenuItem,
     textBoxId: menuText.textBoxId,
-    letterDelayFlags: menuText.letterPrintingDelayFlags
+    letterDelayFlags: menuText.letterPrintingDelayFlags,
+    mapStructure
   };
 }
 

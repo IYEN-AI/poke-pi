@@ -14,15 +14,32 @@ describe("CLI", () => {
     expect(io.out.join("\n")).toContain("preflight");
     expect(io.out.join("\n")).toContain("run");
     expect(io.out.join("\n")).toContain("press");
+    expect(io.out.join("\n")).toContain("dashboard");
+    expect(io.out.join("\n")).toContain("map-heuristic");
+    expect(io.out.join("\n")).toContain("play");
+    expect(io.out.join("\n")).toContain("status");
+    expect(io.out.join("\n")).toContain("clean-failed");
     expect(io.out.join("\n")).toContain("heuristic|openai");
     expect(io.out.join("\n")).toContain("stage1|full-game");
   });
 
   it("parses commands and common options without a CLI framework", () => {
     const parsed = parseCliArgs(["run", "--policy", "openai", "--mode", "full-game", "--max-steps", "9", "--run-id", "manual"]);
+    const dashboard = parseCliArgs(["dashboard", "--port", "4040"]);
+    const mapHeuristic = parseCliArgs(["map-heuristic", "--max-steps", "12", "--run-id", "map-cli", "--with-dashboard", "--port", "3031"]);
+    const play = parseCliArgs(["play", "--max-steps", "5", "--run-id", "easy", "--port", "3032"]);
+    const cleanFailed = parseCliArgs(["clean-failed", "--yes"]);
 
     expect(parsed.errors).toEqual([]);
     expect(parsed.options).toMatchObject({ command: "run", policy: "openai", mode: "full-game", maxSteps: 9, runId: "manual" });
+    expect(dashboard.errors).toEqual([]);
+    expect(dashboard.options).toMatchObject({ command: "dashboard", dashboardPort: 4040 });
+    expect(mapHeuristic.errors).toEqual([]);
+    expect(mapHeuristic.options).toMatchObject({ command: "map-heuristic", maxSteps: 12, runId: "map-cli", withDashboard: true, dashboardPort: 3031 });
+    expect(play.errors).toEqual([]);
+    expect(play.options).toMatchObject({ command: "play", maxSteps: 5, runId: "easy", dashboardPort: 3032 });
+    expect(cleanFailed.errors).toEqual([]);
+    expect(cleanFailed.options).toMatchObject({ command: "clean-failed", yes: true });
   });
 
   it("rejects unsupported policy names", () => {
@@ -151,6 +168,128 @@ describe("CLI", () => {
     expect(io.out.join("\n")).toContain("completed");
   });
 
+
+
+
+
+  it("runs status as redacted config plus preflight", async () => {
+    const io = createIo();
+    const exitCode = await runCli(["status"], io, {
+      loadConfig(env) {
+        return createTestConfig({ aiProvider: env.AI_PROVIDER === "openai" ? "openai" : "heuristic" });
+      },
+      async runPreflight() {
+        return { ok: true, checks: [{ name: "current_frame", status: "pass", message: "ok" }] };
+      }
+    });
+
+    expect(exitCode).toBe(0);
+    expect(io.out.join("\n")).toContain('"mgbaHttpBaseUrl"');
+    expect(io.out.join("\n")).toContain("mGBA preflight passed");
+  });
+
+  it("runs play by POSTing to the HTTP control server", async () => {
+    const io = createIo();
+    const requests: Array<{ baseUrl: string; path: string; body: unknown }> = [];
+
+    const exitCode = await runCli(["play", "--max-steps", "3", "--run-id", "easy-play", "--port", "3033"], io, {
+      async controlRequest(baseUrl, path, body) {
+        requests.push({ baseUrl, path, body });
+        if (path === "/api/control/status") {
+          return { status: 200, body: { running: false } };
+        }
+        return { status: 202, body: { started: true, activeRun: { kind: "play", runId: "easy-play" } } };
+      }
+    });
+
+    expect(exitCode).toBe(0);
+    expect(requests).toEqual([
+      { baseUrl: "http://127.0.0.1:3033", path: "/api/control/status", body: undefined },
+      { baseUrl: "http://127.0.0.1:3033", path: "/api/control/play", body: { maxSteps: 3, runId: "easy-play", mode: "stage1" } }
+    ]);
+    expect(io.out.join("\n")).toContain('"command": "play"');
+  });
+
+  it("runs llm by POSTing to the HTTP control server", async () => {
+    const io = createIo();
+    const requests: Array<{ path: string; body: unknown }> = [];
+
+    const exitCode = await withEnv({ OPENAI_API_KEY: "unit-test-key" }, () => runCli(["llm", "--max-steps", "2", "--run-id", "llm-easy"], io, {
+      async controlRequest(_baseUrl, path, body) {
+        requests.push({ path, body });
+        if (path === "/api/control/status") {
+          return { status: 200, body: { running: false } };
+        }
+        return { status: 202, body: { started: true, activeRun: { kind: "llm", runId: "llm-easy" } } };
+      }
+    }));
+
+    expect(exitCode).toBe(0);
+    expect(requests).toEqual([
+      { path: "/api/control/status", body: undefined },
+      { path: "/api/control/llm", body: { maxSteps: 2, runId: "llm-easy", mode: "stage1" } }
+    ]);
+  });
+
+  it("requires confirmation before deleting failed runs", async () => {
+    const io = createIo();
+
+    const exitCode = await runCli(["clean-failed"], io);
+
+    expect(exitCode).toBe(1);
+    expect(io.err.join("\n")).toContain("--yes");
+  });
+
+  it("runs the map-heuristic convenience command with heuristic stage1 config and optional dashboard", async () => {
+    const io = createIo();
+    const seen: Array<{ config: HarnessConfig; maxSteps?: number }> = [];
+    let dashboardClosed = false;
+
+    const exitCode = await withEnv({ AI_PROVIDER: "openai", OPENAI_API_KEY: "unit-test-key" }, () => runCli([
+      "map-heuristic",
+      "--max-steps",
+      "4",
+      "--run-id",
+      "map-cli-run",
+      "--with-dashboard",
+      "--port",
+      "3131"
+    ], io, {
+      async startDashboard(config, port) {
+        expect(config.aiProvider).toBe("heuristic");
+        expect(config.harnessMode).toBe("stage1");
+        expect(port).toBe(3131);
+        return {
+          url: "http://127.0.0.1:3131",
+          async close() {
+            dashboardClosed = true;
+          }
+        };
+      },
+      createRunner(config, options) {
+        seen.push({ config, maxSteps: options.maxSteps });
+        return {
+          async snapshot() {
+            throw new Error("snapshot should not run");
+          },
+          async run() {
+            return { status: "completed" };
+          }
+        };
+      }
+    }));
+
+    expect(exitCode).toBe(0);
+    expect(dashboardClosed).toBe(true);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.config.aiProvider).toBe("heuristic");
+    expect(seen[0]?.config.harnessMode).toBe("stage1");
+    expect(seen[0]?.config.harnessRunId).toBe("map-cli-run");
+    expect(seen[0]?.maxSteps).toBe(4);
+    expect(io.out.join("\n")).toContain("Dashboard listening at http://127.0.0.1:3131");
+    expect(io.out.join("\n")).toContain('"command": "map-heuristic"');
+  });
+
   it("validates press through the action schema before executing", async () => {
     const io = createIo();
     const actions: unknown[] = [];
@@ -176,6 +315,25 @@ describe("CLI", () => {
     expect(getHarnessHelp()).toContain("mGBA preflight");
   });
 });
+
+
+function createTestConfig(overrides: Partial<HarnessConfig> = {}): HarnessConfig {
+  return {
+    mgbaHttpBaseUrl: "http://127.0.0.1:5000",
+    pokemonVersion: "red",
+    harnessMode: "stage1",
+    evidenceDir: "runs",
+    harnessRunId: "test-run",
+    logLevel: "info",
+    loopMaxSteps: 10,
+    loopStepDelayMs: 0,
+    maxLlmCalls: 10,
+    defaultTapFrames: 5,
+    defaultHoldFrames: 15,
+    aiProvider: "heuristic",
+    ...overrides
+  } as HarnessConfig;
+}
 
 function createIo() {
   const out: string[] = [];

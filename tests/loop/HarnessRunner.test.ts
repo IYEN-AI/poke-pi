@@ -135,6 +135,28 @@ describe("HarnessRunner", () => {
     expect(evidence.errors[0]).toMatchObject({ code: "STUCK" });
   });
 
+
+  it("records Pokemon improvement telemetry for dashboard analysis", async () => {
+    const evidence = new FakeEvidenceRecorder();
+    const runner = createRunner({
+      evidence,
+      states: [state({ wCurMap: 0, wYCoord: 1, wXCoord: 10, screenTextKind: "overworld_text", screenText: "OAK: Hey! Wait!" })],
+      budgets: { maxSteps: 1, repeatedStateThreshold: 10 }
+    });
+
+    await runner.run();
+
+    expect(evidence.telemetry).toHaveLength(1);
+    expect(evidence.telemetry[0]).toMatchObject({
+      schema: "pokemon-harness-telemetry.v1",
+      step: 1,
+      route: "pallet_town",
+      location: { mapId: 0, y: 1, x: 10 },
+      decision: { action: waitDecision.action, confidence: waitDecision.confidence },
+      progress: { newCheckpoints: ["initialObserved"] }
+    });
+  });
+
   it("maps mGBA, invalid-state, policy, and controller errors to safe final statuses", async () => {
     await expectFailure(
       createRunner({ frameError: new HarnessError("MGBA_UNAVAILABLE", "mGBA down") }),
@@ -305,6 +327,7 @@ class FakeEvidenceRecorder implements RunnerEvidenceRecorder {
   readonly actions: unknown[] = [];
   readonly screenshots: unknown[] = [];
   readonly errors: unknown[] = [];
+  readonly telemetry: unknown[] = [];
   started: unknown;
   finished: { status: string; result: unknown } | undefined;
 
@@ -328,6 +351,10 @@ class FakeEvidenceRecorder implements RunnerEvidenceRecorder {
   async recordScreenshot(metadata: unknown): Promise<string> {
     this.screenshots.push(metadata);
     return `screenshot-${this.screenshots.length}.json`;
+  }
+
+  async recordTelemetry(telemetry: unknown): Promise<void> {
+    this.telemetry.push(telemetry);
   }
 
   async recordError(error: unknown): Promise<string> {

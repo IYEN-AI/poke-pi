@@ -1,4 +1,8 @@
 import "dotenv/config";
+import { execFile } from "node:child_process";
+import { readdir, readFile, rm } from "node:fs/promises";
+import path from "node:path";
+import { promisify } from "node:util";
 import { pathToFileURL } from "node:url";
 import { inspect } from "node:util";
 import { HeuristicPolicy } from "./ai/HeuristicPolicy.js";
@@ -18,8 +22,9 @@ import { runMgbaPreflight, type MgbaPreflightReport } from "./mgba/preflight.js"
 import { PokemonStateReader } from "./pokemon/PokemonStateReader.js";
 import { FullGameDetector } from "./pokemon/FullGameDetector.js";
 import { Stage1Detector } from "./pokemon/Stage1Detector.js";
+import { startDashboard, type DashboardHandle } from "./dashboardServer.js";
 
-type HarnessCommand = "snapshot" | "preflight" | "run" | "press" | "smoke";
+type HarnessCommand = "snapshot" | "preflight" | "run" | "press" | "smoke" | "dashboard" | "map-heuristic" | "status" | "play" | "llm" | "ui" | "doctor" | "stop" | "clean-failed";
 
 export interface CliOptions {
   readonly command?: HarnessCommand;
@@ -31,6 +36,9 @@ export interface CliOptions {
   readonly runId?: string;
   readonly pressButton?: string;
   readonly pressFrames?: number;
+  readonly dashboardPort?: number;
+  readonly withDashboard: boolean;
+  readonly yes: boolean;
 }
 
 export interface CliIo {
@@ -43,6 +51,8 @@ export interface CliFactories {
   readonly createRunner?: (config: HarnessConfig, options: RunnerCommandOptions) => CliRunner;
   readonly runPreflight?: (config: HarnessConfig) => Promise<MgbaPreflightReport>;
   readonly executePress?: (config: HarnessConfig, action: unknown) => Promise<void>;
+  readonly startDashboard?: (config: HarnessConfig, port?: number) => Promise<DashboardHandle>;
+  readonly controlRequest?: (baseUrl: string, path: string, body?: unknown) => Promise<{ status: number; body: unknown }>;
 }
 
 export interface CliRunner {
@@ -59,6 +69,8 @@ interface ParsedOptionResult {
   readonly errors: string[];
 }
 
+const execFileAsync = promisify(execFile);
+
 const DEFAULT_IO: CliIo = {
   stdout: (message) => console.log(message),
   stderr: (message) => console.error(message)
@@ -73,15 +85,32 @@ export function getHarnessHelp(): string {
     "  npm run harness -- snapshot [--dry-run] [--policy heuristic|openai] [--mode stage1|full-game] [--max-steps N] [--run-id ID]",
     "  npm run harness -- preflight [--policy heuristic|openai] [--mode stage1|full-game] [--run-id ID]",
     "  npm run harness -- run [--policy heuristic|openai] [--mode stage1|full-game] [--max-steps N] [--run-id ID]",
+    "  npm run poke -- status",
+    "  npm run poke -- play [--max-steps N] [--run-id ID] [--port N]",
+    "  npm run poke -- llm [--max-steps N] [--run-id ID] [--port N]",
+    "  npm run poke -- ui [--port N]",
+    "  npm run poke -- stop",
+    "  npm run poke -- clean-failed --yes",
+    "  npm run harness -- map-heuristic [--max-steps N] [--run-id ID] [--with-dashboard] [--port N]",
     "  npm run harness -- press BUTTON [--frames N] [--run-id ID]",
     "  npm run smoke:mgba",
+    "  npm run harness -- dashboard [--port N] [--policy heuristic|openai] [--mode stage1|full-game]",
     "",
     "Commands:",
     "  snapshot   Record one runner snapshot, or print config only with --dry-run.",
     "  preflight  Run mGBA preflight against the manually started service and loaded ROM state.",
     "  run        Start the selected harness loop. Defaults to Stage 1.",
+    "  map-heuristic  Run map-aware heuristic exploration; optionally starts the dashboard for the run.",
+    "  status     Print redacted config and mGBA preflight status.",
+    "  play       Start map-aware heuristic Stage 1 with dashboard enabled by default.",
+    "  llm        Start OpenAI-compatible Stage 1 with dashboard enabled by default.",
+    "  ui         Start the dashboard alias.",
+    "  doctor     Run preflight alias.",
+    "  stop       Stop repo-started harness/dashboard Node processes; leaves mGBA alone.",
+    "  clean-failed  Delete non-completed run directories; requires --yes.",
     "  press      Send one safe Game Boy button press for smoke checks.",
     "  smoke      Opt-in mGBA smoke: preflight, snapshot, press B, snapshot.",
+    "  dashboard  Start a local web dashboard for live screen, RAM state, and run evidence.",
     "",
     "Safe buttons: A, B, Start, Select, Up, Down, Left, Right"
   ].join("\n");
@@ -89,7 +118,7 @@ export function getHarnessHelp(): string {
 
 export function parseCliArgs(args: readonly string[]): ParsedOptionResult {
   const errors: string[] = [];
-  const options: MutableCliOptions = { dryRun: false, help: false };
+  const options: MutableCliOptions = { dryRun: false, help: false, withDashboard: false, yes: false };
   const rest: string[] = [];
 
   for (let index = 0; index < args.length; index += 1) {
@@ -116,6 +145,16 @@ export function parseCliArgs(args: readonly string[]): ParsedOptionResult {
         break;
       case "--frames":
         options.pressFrames = parsePositiveInteger(args[++index], "--frames", errors);
+        break;
+      case "--port":
+        options.dashboardPort = parsePositiveInteger(args[++index], "--port", errors);
+        break;
+      case "--with-dashboard":
+        options.withDashboard = true;
+        break;
+      case "--yes":
+      case "-y":
+        options.yes = true;
         break;
       default:
         if (arg?.startsWith("--") === true) {
@@ -168,13 +207,29 @@ export async function runCli(
       case "snapshot":
         return await handleSnapshot(parsed.options, io, factories);
       case "preflight":
+      case "doctor":
         return await handlePreflight(parsed.options, io, factories);
+      case "status":
+        return await handleStatus(parsed.options, io, factories);
       case "run":
         return await handleRun(parsed.options, io, factories);
+      case "map-heuristic":
+        return await handleMapHeuristic(parsed.options, io, factories);
+      case "play":
+        return await handlePlay(parsed.options, io, factories);
+      case "llm":
+        return await handleLlm(parsed.options, io, factories);
       case "press":
         return await handlePress(parsed.options, io, factories);
       case "smoke":
         return await handleSmoke(parsed.options, io);
+      case "dashboard":
+      case "ui":
+        return await handleDashboard(parsed.options, io, factories);
+      case "stop":
+        return await handleStop(parsed.options, io, factories);
+      case "clean-failed":
+        return await handleCleanFailed(parsed.options, io, factories);
       default:
         io.stderr("Missing command.\n" + getHarnessHelp());
         return 1;
@@ -231,12 +286,161 @@ async function handlePreflight(options: CliOptions, io: CliIo, factories: CliFac
   return report.ok ? 0 : 1;
 }
 
+
+async function handleStatus(options: CliOptions, io: CliIo, factories: CliFactories): Promise<number> {
+  const config = loadCommandConfig(options, factories, true);
+  io.stdout(formatConfigSummary(config));
+  const report = await (factories.runPreflight ?? ((loadedConfig) => runMgbaPreflight({ config: loadedConfig })))(config);
+  io.stdout(formatPreflightReport(report));
+  return report.ok ? 0 : 1;
+}
+
 async function handleRun(options: CliOptions, io: CliIo, factories: CliFactories): Promise<number> {
   const config = loadCommandConfig(options, factories);
   const runner = (factories.createRunner ?? createRunner)(config, { maxSteps: options.maxSteps });
   const result = await runner.run();
   io.stdout(redactSecrets({ command: "run", result }));
   return result.status === "completed" ? 0 : 1;
+}
+
+
+async function handleMapHeuristic(options: CliOptions, io: CliIo, factories: CliFactories): Promise<number> {
+  const config = loadCommandConfig({
+    ...options,
+    policy: "heuristic",
+    mode: options.mode ?? "stage1",
+    runId: options.runId ?? `map-heuristic-${Date.now()}`
+  }, factories);
+  const dashboard = options.withDashboard
+    ? await (factories.startDashboard ?? startDashboardFromConfig)(config, options.dashboardPort)
+    : undefined;
+
+  if (dashboard !== undefined) {
+    io.stdout(`Dashboard listening at ${dashboard.url}`);
+  }
+
+  try {
+    const runner = (factories.createRunner ?? createRunner)(config, { maxSteps: options.maxSteps });
+    const result = await runner.run();
+    io.stdout(redactSecrets({ command: "map-heuristic", dashboardUrl: dashboard?.url, result }));
+    return result.status === "completed" ? 0 : 1;
+  } finally {
+    await dashboard?.close();
+  }
+}
+
+
+async function handlePlay(options: CliOptions, io: CliIo, factories: CliFactories): Promise<number> {
+  return startControlledRun("play", options, io, factories);
+}
+
+async function handleLlm(options: CliOptions, io: CliIo, factories: CliFactories): Promise<number> {
+  return startControlledRun("llm", options, io, factories);
+}
+
+async function startControlledRun(kind: "play" | "llm", options: CliOptions, io: CliIo, factories: CliFactories): Promise<number> {
+  const config = loadCommandConfig({
+    ...options,
+    policy: kind === "llm" ? "openai" : "heuristic",
+    mode: options.mode ?? "stage1",
+    runId: options.runId ?? `${kind}-${Date.now()}`
+  }, factories);
+  const control = await getControlServer(config, options.dashboardPort, io, factories);
+  const response = await requestControl(control.url, `/api/control/${kind}`, {
+    maxSteps: options.maxSteps,
+    runId: config.harnessRunId,
+    mode: config.harnessMode
+  }, factories);
+  io.stdout(redactSecrets({ command: kind, dashboardUrl: control.url, response: response.body }));
+
+  if (response.status >= 400) {
+    await control.startedHere?.close();
+    return 1;
+  }
+
+  if (control.startedHere !== undefined) {
+    await waitForControlledRun(control.url, factories);
+    await control.startedHere.close();
+  }
+
+  return 0;
+}
+
+async function handleStop(options: CliOptions, io: CliIo, factories: CliFactories): Promise<number> {
+  const baseUrl = controlBaseUrl(options.dashboardPort);
+  try {
+    const response = await requestControl(baseUrl, "/api/control/stop", {}, factories);
+    if (response.status >= 400) {
+      throw new Error("control server unavailable");
+    }
+    io.stdout(redactSecrets({ command: "stop", dashboardUrl: baseUrl, response: response.body, note: "mGBA and mGBA-http are left running" }));
+    return 0;
+  } catch {
+    if (process.platform === "win32") {
+      io.stderr("stop could not reach the control server and process fallback is only implemented for Unix-like shells.");
+      return 1;
+    }
+
+    const patterns = ["tsx src/index.ts run", "tsx src/index.ts dashboard", "tsx src/index.ts map-heuristic"];
+    const stopped = await stopRepoNodeProcesses(patterns);
+
+    io.stdout(redactSecrets({ command: "stop", stopped, note: "control server unavailable; mGBA and mGBA-http are left running" }));
+    return 0;
+  }
+}
+
+async function handleCleanFailed(options: CliOptions, io: CliIo, factories: CliFactories): Promise<number> {
+  if (!options.yes) {
+    io.stderr("clean-failed deletes run directories. Re-run with --yes to confirm.");
+    return 1;
+  }
+
+  const baseUrl = controlBaseUrl(options.dashboardPort);
+  try {
+    const response = await requestControl(baseUrl, "/api/control/clean-failed", {}, factories);
+    if (response.status >= 400) {
+      throw new Error("control server unavailable");
+    }
+    io.stdout(redactSecrets({ command: "clean-failed", dashboardUrl: baseUrl, response: response.body }));
+    return 0;
+  } catch {
+    // Fall back to local filesystem cleanup when the control server is not running.
+  }
+
+  const config = loadCommandConfig(options, factories, true);
+  const removed: Array<{ runId: string; status: string }> = [];
+  const entries = await readdir(config.evidenceDir, { withFileTypes: true }).catch(() => []);
+  for (const entry of entries) {
+    if (!entry.isDirectory() || entry.name.startsWith(".")) {
+      continue;
+    }
+
+    const runDir = path.join(config.evidenceDir, entry.name);
+    const status = await readRunStatus(runDir);
+    if (status !== "completed") {
+      await rm(runDir, { force: true, recursive: true });
+      removed.push({ runId: entry.name, status });
+    }
+  }
+
+  io.stdout(redactSecrets({ command: "clean-failed", removed }));
+  return 0;
+}
+
+async function readRunStatus(runDir: string): Promise<string> {
+  try {
+    const parsed = JSON.parse(await readFile(path.join(runDir, "summary.json"), "utf8")) as { status?: unknown };
+    return typeof parsed.status === "string" ? parsed.status : "unknown";
+  } catch {
+    return "missing_summary";
+  }
+}
+
+async function handleDashboard(options: CliOptions, io: CliIo, factories: CliFactories): Promise<number> {
+  const config = loadCommandConfig(options, factories);
+  const handle = await (factories.startDashboard ?? startDashboardFromConfig)(config, options.dashboardPort);
+  io.stdout(`Dashboard listening at ${handle.url}`);
+  return await new Promise<number>(() => {});
 }
 
 async function handlePress(options: CliOptions, io: CliIo, factories: CliFactories): Promise<number> {
@@ -250,9 +454,20 @@ async function handlePress(options: CliOptions, io: CliIo, factories: CliFactori
     });
   }
 
-  await (factories.executePress ?? executePress)(config, parsed.data);
-  io.stdout(redactSecrets({ command: "press", action: parsed.data, status: "executed" }));
-  return 0;
+  try {
+    const baseUrl = controlBaseUrl(options.dashboardPort);
+    const status = await requestControl(baseUrl, "/api/control/status", undefined, factories, "GET");
+    if (status.status >= 400) {
+      throw new Error("control server unavailable");
+    }
+    const response = await requestControl(baseUrl, "/api/control/press", { button: parsed.data.button, frames: parsed.data.frames }, factories);
+    io.stdout(redactSecrets({ command: "press", dashboardUrl: baseUrl, response: response.body }));
+    return response.status >= 400 ? 1 : 0;
+  } catch {
+    await (factories.executePress ?? executePress)(config, parsed.data);
+    io.stdout(redactSecrets({ command: "press", action: parsed.data, status: "executed", transport: "direct" }));
+    return 0;
+  }
 }
 
 async function handleSmoke(options: CliOptions, io: CliIo): Promise<number> {
@@ -321,6 +536,92 @@ function createRunner(config: HarnessConfig, options: RunnerCommandOptions): Cli
   });
 }
 
+
+function controlBaseUrl(port?: number): string {
+  return `http://127.0.0.1:${port ?? 3030}`;
+}
+
+async function getControlServer(
+  config: HarnessConfig,
+  port: number | undefined,
+  io: CliIo,
+  factories: CliFactories
+): Promise<{ url: string; startedHere?: DashboardHandle }> {
+  const baseUrl = controlBaseUrl(port);
+  try {
+    await requestControl(baseUrl, "/api/control/status", undefined, factories, "GET");
+    return { url: baseUrl };
+  } catch {
+    const handle = await startControlDashboard(config, port, factories);
+    io.stdout(`Dashboard listening at ${handle.url}`);
+    return { url: handle.url, startedHere: handle };
+  }
+}
+
+async function requestControl(
+  baseUrl: string,
+  pathName: string,
+  body: unknown,
+  factories: CliFactories,
+  method = "POST"
+): Promise<{ status: number; body: unknown }> {
+  if (factories.controlRequest !== undefined) {
+    return factories.controlRequest(baseUrl, pathName, body);
+  }
+
+  const response = await fetch(`${baseUrl}${pathName}`, {
+    method,
+    headers: method === "POST" ? { "content-type": "application/json" } : undefined,
+    body: method === "POST" ? JSON.stringify(body ?? {}) : undefined
+  });
+  return { status: response.status, body: await response.json() };
+}
+
+async function waitForControlledRun(baseUrl: string, factories: CliFactories): Promise<void> {
+  while (true) {
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    const status = await requestControl(baseUrl, "/api/control/status", undefined, factories, "GET");
+    if (objectField(status.body, "running") !== true) {
+      return;
+    }
+  }
+}
+
+
+async function startControlDashboard(config: HarnessConfig, port: number | undefined, factories: CliFactories): Promise<DashboardHandle> {
+  try {
+    return await (factories.startDashboard ?? startDashboardFromConfig)(config, port);
+  } catch (error) {
+    if (!isAddressInUseError(error) || factories.startDashboard !== undefined || process.platform === "win32") {
+      throw error;
+    }
+
+    await stopRepoNodeProcesses(["tsx src/index.ts dashboard"]);
+    return await startDashboardFromConfig(config, port);
+  }
+}
+
+async function stopRepoNodeProcesses(patterns: readonly string[]): Promise<string[]> {
+  const stopped: string[] = [];
+  for (const pattern of patterns) {
+    try {
+      await execFileAsync("pkill", ["-f", pattern]);
+      stopped.push(pattern);
+    } catch {
+      // pkill exits nonzero when no process matched; that is fine.
+    }
+  }
+  return stopped;
+}
+
+function isAddressInUseError(error: unknown): boolean {
+  return error instanceof Error && (error.message.includes("EADDRINUSE") || ("code" in error && (error as NodeJS.ErrnoException).code === "EADDRINUSE"));
+}
+
+async function startDashboardFromConfig(config: HarnessConfig, port?: number): Promise<DashboardHandle> {
+  return startDashboard({ config, port });
+}
+
 async function executePress(config: HarnessConfig, action: { type: "press"; button: MgbaButton; frames: number }): Promise<void> {
   const client = new MgbaHttpClient({ baseUrl: config.mgbaHttpBaseUrl });
   const controller = new Controller({
@@ -376,6 +677,10 @@ function formatPreflightReport(report: MgbaPreflightReport): string {
   }
 
   return redactSecrets(lines.join("\n"));
+}
+
+function objectField(value: unknown, key: string): unknown {
+  return typeof value === "object" && value !== null ? (value as Record<string, unknown>)[key] : undefined;
 }
 
 function formatSafeError(error: unknown): string {
@@ -438,7 +743,7 @@ function parseNonEmpty(value: string | undefined, name: string, errors: string[]
 }
 
 function isHarnessCommand(value: string): value is HarnessCommand {
-  return value === "snapshot" || value === "preflight" || value === "run" || value === "press" || value === "smoke";
+  return value === "snapshot" || value === "preflight" || value === "run" || value === "press" || value === "smoke" || value === "dashboard" || value === "map-heuristic" || value === "status" || value === "play" || value === "llm" || value === "ui" || value === "doctor" || value === "stop" || value === "clean-failed";
 }
 
 interface MutableCliOptions {
@@ -451,6 +756,9 @@ interface MutableCliOptions {
   runId?: string;
   pressButton?: string;
   pressFrames?: number;
+  dashboardPort?: number;
+  withDashboard: boolean;
+  yes: boolean;
 }
 
 if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {

@@ -1,4 +1,5 @@
 import type { PolicyDecision } from "../control/ActionTypes.js";
+import type { PokemonMapStructure } from "../pokemon/PokemonTypes.js";
 
 export interface PokemonStateSnapshot {
   wIsInBattle?: number | boolean;
@@ -26,6 +27,7 @@ export interface PokemonStateSnapshot {
   wNamingScreenType?: number;
   menuActive?: boolean;
   textActive?: boolean;
+  mapStructure?: PokemonMapStructure;
   [key: string]: unknown;
 }
 

@@ -27,6 +27,7 @@ export interface RunnerEvidenceRecorder {
   recordAction(action: unknown): Promise<void>;
   recordScreenshot(metadata: ScreenshotMetadata): Promise<string>;
   recordError(error: unknown): Promise<string>;
+  recordTelemetry?(telemetry: unknown): Promise<void>;
   finishRun(status: HarnessStatus, result?: unknown): Promise<unknown>;
 }
 
@@ -170,7 +171,9 @@ export class HarnessRunner<TState = PokemonStateSnapshot> {
         const actionSummary = this.recordAction(snapshot, decision);
         await this.evidence.recordAction(actionSummary);
 
+        const detectorBefore = this.detector.getStatus();
         const detectorStatus = this.detector.update(toDetectorState(snapshot.state), decision.action, snapshot.frame);
+        await this.recordPokemonTelemetry(snapshot, decision, actionSummary, detectorBefore, detectorStatus);
         status = detectorStatus.status;
 
         if (status === "completed" || status === "failed_stuck") {
@@ -250,6 +253,34 @@ export class HarnessRunner<TState = PokemonStateSnapshot> {
     return summary;
   }
 
+  private async recordPokemonTelemetry(
+    snapshot: HarnessSnapshot<TState>,
+    decision: PolicyDecision,
+    actionSummary: RecordedActionSummary,
+    detectorBefore: DetectorStatus,
+    detectorAfter: DetectorStatus
+  ): Promise<void> {
+    if (this.evidence.recordTelemetry === undefined) {
+      return;
+    }
+
+    await this.evidence.recordTelemetry(createPokemonTelemetry({
+      step: this.step,
+      frame: snapshot.frame,
+      state: snapshot.state,
+      stateHash: snapshot.stateHash,
+      decision,
+      actionSummary,
+      detectorBefore,
+      detectorAfter,
+      recentActions: this.last20Actions,
+      recentStateHashes: this.recentStateHashes,
+      repeatedStateThreshold: this.repeatedStateThreshold,
+      llmCalls: this.llmCalls,
+      maxLlmCalls: this.maxLlmCalls
+    }));
+  }
+
   private detectRepeatedStateFailure(): RunnerFailure | undefined {
     if (this.recentStateHashes.length < this.repeatedStateThreshold) {
       return undefined;
@@ -311,6 +342,193 @@ export class HarnessRunner<TState = PokemonStateSnapshot> {
   private timestamp(): string {
     return this.now().toISOString();
   }
+}
+
+interface PokemonTelemetryInput<TState> {
+  readonly step: number;
+  readonly frame: FrameNumber;
+  readonly state: TState;
+  readonly stateHash: string;
+  readonly decision: PolicyDecision;
+  readonly actionSummary: RecordedActionSummary;
+  readonly detectorBefore: DetectorStatus;
+  readonly detectorAfter: DetectorStatus;
+  readonly recentActions: readonly RecordedActionSummary[];
+  readonly recentStateHashes: readonly string[];
+  readonly repeatedStateThreshold: number;
+  readonly llmCalls: number;
+  readonly maxLlmCalls: number;
+}
+
+function createPokemonTelemetry<TState>(input: PokemonTelemetryInput<TState>): unknown {
+  const state = toPolicyState(input.state);
+  const detectorBeforeEvidence = checkpointEvidenceLength(input.detectorBefore);
+  const detectorAfterEvidence = checkpointEvidence(input.detectorAfter);
+  const newCheckpoints = detectorAfterEvidence.slice(detectorBeforeEvidence).map((entry) => objectField(entry, "checkpoint")).filter((value): value is string => typeof value === "string");
+  const repeatedTail = countSameTail(input.recentStateHashes);
+  const action = input.actionSummary.action;
+  const route = routeContext(state);
+  const categories = telemetryCategories(state, input.decision, action, newCheckpoints, repeatedTail);
+
+  return {
+    schema: "pokemon-harness-telemetry.v1",
+    step: input.step,
+    frame: input.frame,
+    stateHash: input.stateHash,
+    categories,
+    route,
+    location: {
+      mapId: state.wCurMap ?? state.mapId,
+      y: state.wYCoord ?? state.y,
+      x: state.wXCoord ?? state.x,
+      yBlock: state.wYBlockCoord,
+      xBlock: state.wXBlockCoord,
+      facing: state.playerFacingDirection
+    },
+    battle: {
+      kind: typeof state.battle === "object" && state.battle !== null ? objectField(state.battle, "kind") : undefined,
+      raw: state.wIsInBattle,
+      battleType: state.wBattleType,
+      result: state.wBattleResult,
+      playerHp: state.wBattleMonHP ?? state.wPartyMon1HP,
+      playerMaxHp: state.wPartyMon1MaxHP,
+      enemyHp: state.wEnemyMonHP
+    },
+    party: {
+      count: state.wPartyCount ?? state.partyCount,
+      firstHp: state.wPartyMon1HP,
+      firstMaxHp: state.wPartyMon1MaxHP
+    },
+    badges: {
+      raw: state.wObtainedBadges,
+      count: state.badgeCount,
+      obtained: state.badgesObtained
+    },
+    text: {
+      kind: state.screenTextKind,
+      textBoxId: state.wTextBoxID ?? state.textBoxId,
+      menuItem: state.wCurrentMenuItem ?? state.menuItem,
+      letterDelayFlags: state.wLetterPrintingDelayFlags ?? state.letterDelayFlags,
+      preview: truncate(typeof state.screenText === "string" ? state.screenText : "", 180),
+      naming: {
+        nameLength: state.wNamingScreenNameLength,
+        submitName: state.wNamingScreenSubmitName,
+        type: state.wNamingScreenType
+      }
+    },
+    decision: {
+      action,
+      confidence: input.decision.confidence,
+      rationale: input.decision.rationale,
+      citations: input.decision.observedStateCitations,
+      lowConfidence: input.decision.confidence < 0.45,
+      fallback: input.decision.rationale.includes("LLM fallback after") || input.decision.observedStateCitations.some((citation) => citation.includes("LLM fallback after"))
+    },
+    progress: {
+      status: input.detectorAfter.status,
+      checkpoints: input.detectorAfter.checkpoints,
+      newCheckpoints,
+      progressStep: numberField(input.detectorAfter, "progressStep"),
+      lastProgressStep: numberField(input.detectorAfter, "lastProgressStep"),
+      stuckStepCount: numberField(input.detectorAfter, "stuckStepCount"),
+      repeatedStateTail: repeatedTail,
+      repeatedStateThreshold: input.repeatedStateThreshold,
+      llmCalls: input.llmCalls,
+      maxLlmCalls: input.maxLlmCalls
+    },
+    improvementSignals: improvementSignals({
+      state,
+      decision: input.decision,
+      action,
+      newCheckpoints,
+      repeatedTail,
+      repeatedStateThreshold: input.repeatedStateThreshold,
+      recentActions: input.recentActions
+    })
+  };
+}
+
+function routeContext(state: PokemonStateSnapshot): string {
+  const mapId = state.wCurMap ?? state.mapId;
+  if (mapId === 38) return "red_house_2f";
+  if (mapId === 37) return "red_house_1f";
+  if (mapId === 0) return "pallet_town";
+  if (mapId === 40) return "oak_lab";
+  if (mapId === 0x76) return "hall_of_fame";
+  if (state.screenTextKind === "oak_intro") return "oak_intro";
+  if (state.screenTextKind === "naming_screen" || state.screenTextKind === "default_name_menu") return "name_flow";
+  return "unknown";
+}
+
+function telemetryCategories(state: PokemonStateSnapshot, decision: PolicyDecision, action: PolicyDecision["action"], newCheckpoints: readonly string[], repeatedTail: number): string[] {
+  const categories = new Set<string>(["step"]);
+  if ((state.wIsInBattle ?? 0) !== 0) categories.add("battle");
+  if (state.screenTextKind !== undefined && state.screenTextKind !== "none") categories.add("text");
+  if (state.menuItem !== undefined || state.wCurrentMenuItem !== undefined) categories.add("menu");
+  if (newCheckpoints.length > 0) categories.add("progress");
+  if (decision.confidence < 0.45) categories.add("low_confidence");
+  if (repeatedTail >= 5) categories.add("possible_stuck");
+  if (action.type === "sequence") categories.add("sequence");
+  return [...categories];
+}
+
+function improvementSignals(input: {
+  readonly state: PokemonStateSnapshot;
+  readonly decision: PolicyDecision;
+  readonly action: PolicyDecision["action"];
+  readonly newCheckpoints: readonly string[];
+  readonly repeatedTail: number;
+  readonly repeatedStateThreshold: number;
+  readonly recentActions: readonly RecordedActionSummary[];
+}): string[] {
+  const signals: string[] = [];
+  if (input.decision.confidence < 0.45) signals.push("low_confidence_decision");
+  if (input.decision.rationale.includes("LLM fallback after")) signals.push("llm_fallback_used");
+  if (input.newCheckpoints.length > 0) signals.push(`checkpoint:${input.newCheckpoints.join(",")}`);
+  if (input.repeatedTail >= Math.max(5, Math.floor(input.repeatedStateThreshold / 3))) signals.push("repeated_state_tail");
+  if (sameActionTail(input.recentActions, 6)) signals.push("repeated_action_pattern");
+  if ((input.state.wIsInBattle ?? 0) !== 0 && input.action.type === "press" && input.action.button !== "A") signals.push("battle_non_attack_input");
+  if (input.state.screenTextKind !== undefined && input.state.screenTextKind !== "none" && input.action.type === "press" && !["A", "B", "Start"].includes(input.action.button)) signals.push("text_screen_directional_input");
+  return signals;
+}
+
+function checkpointEvidence(status: DetectorStatus): unknown[] {
+  const value = objectField(status, "checkpointEvidence");
+  return Array.isArray(value) ? value : [];
+}
+
+function checkpointEvidenceLength(status: DetectorStatus): number {
+  return checkpointEvidence(status).length;
+}
+
+function objectField(value: unknown, field: string): unknown {
+  return value !== null && typeof value === "object" ? (value as Record<string, unknown>)[field] : undefined;
+}
+
+function numberField(value: unknown, field: string): number | undefined {
+  const entry = objectField(value, field);
+  return typeof entry === "number" ? entry : undefined;
+}
+
+function countSameTail(values: readonly string[]): number {
+  const last = values.at(-1);
+  if (last === undefined) return 0;
+  let count = 0;
+  for (let index = values.length - 1; index >= 0; index -= 1) {
+    if (values[index] !== last) break;
+    count += 1;
+  }
+  return count;
+}
+
+function sameActionTail(actions: readonly RecordedActionSummary[], count: number): boolean {
+  if (actions.length < count) return false;
+  const tail = actions.slice(-count).map((entry) => JSON.stringify(entry.action));
+  return tail.every((entry) => entry === tail[0]);
+}
+
+function truncate(value: string, maxLength: number): string {
+  return value.length <= maxLength ? value : `${value.slice(0, maxLength - 1)}…`;
 }
 
 function normalizeFailure(error: unknown): RunnerFailure {

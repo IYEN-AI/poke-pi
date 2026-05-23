@@ -6,6 +6,10 @@ import {
   wBattleResult,
   wBattleType,
   wCurMap,
+  wCurMapHeight,
+  wCurMapTileset,
+  wCurMapWidth,
+  wCurrentTileBlockMapViewPointer,
   wCurrentMenuItem,
   wEnemyMonHP,
   wIsInBattle,
@@ -17,6 +21,8 @@ import {
   wPartyMon1HP,
   wPartyMon1MaxHP,
   wObtainedBadges,
+  wOverworldMap,
+  wOverworldMapLength,
   wSpritePlayerStateData1FacingDirection,
   wTextBoxID,
   wTileMap,
@@ -48,10 +54,16 @@ describe("Red/Blue memory map", () => {
       wPartyMon1MaxHP: 0xd18d,
       wObtainedBadges: 0xd356,
       wCurMap: 0xd35e,
+      wCurrentTileBlockMapViewPointer: 0xd35f,
       wYCoord: 0xd361,
       wXCoord: 0xd362,
       wYBlockCoord: 0xd363,
       wXBlockCoord: 0xd364,
+      wCurMapTileset: 0xd365,
+      wCurMapHeight: 0xd366,
+      wCurMapWidth: 0xd367,
+      wOverworldMap: 0xc580,
+      wOverworldMapLength: 1300,
       wLetterPrintingDelayFlags: 0xd358
     });
   });
@@ -75,10 +87,16 @@ describe("Red/Blue memory map", () => {
     expect(wPartyMon1MaxHP).toBe(0xd18d);
     expect(wObtainedBadges).toBe(0xd356);
     expect(wCurMap).toBe(0xd35e);
+    expect(wCurrentTileBlockMapViewPointer).toBe(0xd35f);
     expect(wYCoord).toBe(0xd361);
     expect(wXCoord).toBe(0xd362);
     expect(wYBlockCoord).toBe(0xd363);
     expect(wXBlockCoord).toBe(0xd364);
+    expect(wCurMapTileset).toBe(0xd365);
+    expect(wCurMapHeight).toBe(0xd366);
+    expect(wCurMapWidth).toBe(0xd367);
+    expect(wOverworldMap).toBe(0xc580);
+    expect(wOverworldMapLength).toBe(1300);
     expect(wLetterPrintingDelayFlags).toBe(0xd358);
     expect(HALL_OF_FAME_MAP_ID).toBe(0x76);
   });

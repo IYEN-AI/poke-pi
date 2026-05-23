@@ -111,6 +111,31 @@ describe("LLMPolicy", () => {
     expect(prompt).not.toContain("Stage 1 route facts");
   });
 
+
+  it("omits temperature for GPT-5 compatible models that reject sampling parameters", async () => {
+    const requests: ChatCompletionRequest[] = [];
+    const client = fakeClient(async (request) => {
+      requests.push(request);
+      return JSON.stringify(validDecision);
+    });
+    const policy = new LLMPolicy({
+      apiKey: "unit-test-key",
+      baseURL: "https://example.invalid/v1",
+      model: "gpt-5.5",
+      timeoutMs: 1000,
+      maxRetries: 0,
+      temperature: 0.2,
+      maxLlmCalls: 10,
+      fallbackPolicy: createFallbackPolicy(),
+      client
+    });
+
+    await expect(policy.chooseAction(policyInput)).resolves.toEqual(validDecision);
+
+    expect(requests[0]).toMatchObject({ model: "gpt-5.5" });
+    expect(requests[0]).not.toHaveProperty("temperature");
+  });
+
   it("passes baseURL, timeout, retry, and API key settings to the OpenAI-compatible client factory", async () => {
     const observedOptions: OpenAIClientOptions[] = [];
     const client = fakeClient(async () => JSON.stringify(validDecision));
