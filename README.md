@@ -68,6 +68,105 @@ OPENAI_TEMPERATURE=0.2
 
 Heuristic mode does not need an API key. `AI_PROVIDER=openai` requires `OPENAI_API_KEY` and sends it only to `OPENAI_BASE_URL`. If `OPENAI_BASE_URL` points at a third-party OpenAI-compatible endpoint, put that provider's key in `OPENAI_API_KEY`; do not send a real OpenAI key to a third-party endpoint. `OPENAI_TEMPERATURE` is the non-secret sampling setting.
 
+## Easy repo control
+
+Use the `poke` wrapper for day-to-day control instead of remembering the lower-level harness flags. The wrapper talks to the dashboard/control server over HTTP when it is already running; if no compatible server is available, `play`/`llm` start one. The wrapper does **not** start or stop mGBA itself; keep the mGBA app, your ROM, the Lua socket script, and mGBA-http running.
+
+### Recommended loop
+
+1. Verify the emulator chain is alive.
+
+```bash
+npm run poke -- status
+```
+
+2. Start the map-aware heuristic player.
+
+```bash
+npm run poke -- play --max-steps 100 --run-id map-1
+```
+
+3. Open the dashboard printed by the command, or start it separately.
+
+```bash
+npm run poke -- ui --port 3030
+```
+
+4. Stop repo-started Node processes when you are done.
+
+```bash
+npm run poke -- stop
+```
+
+### `poke` command reference
+
+| Command | What it does | Typical use |
+| --- | --- | --- |
+| `npm run poke -- status` | Prints redacted config and runs mGBA preflight. | First check when anything looks stuck. |
+| `npm run poke -- play --max-steps 100 --run-id map-1` | Runs Stage 1 with the map-aware heuristic policy and starts the dashboard. | Default autonomous map exploration. |
+| `npm run poke -- llm --max-steps 100 --run-id llm-1` | Runs Stage 1 through the configured OpenAI-compatible provider and starts the dashboard. | Compare LLM decisions against heuristic behavior. |
+| `npm run poke -- ui --port 3030` | Starts only the web dashboard. | Watch screen, RAM state, decisions, and telemetry. |
+| `npm run poke -- press A --frames 5` | Sends one safe manual button input. | Smoke checks or unblocking a prompt manually. |
+| `npm run poke -- stop` | Stops repo-started Node harness/dashboard processes. Leaves mGBA and mGBA-http alone. | Cleanly stop automation without closing the emulator. |
+| `npm run poke -- clean-failed --yes` | Deletes run directories whose summary status is not `completed`. | Clean noisy failed attempts from `runs/`. |
+| `npm run poke -- doctor` | Alias for preflight. | Quick connectivity diagnosis. |
+
+`play` is the recommended default for map exploration. It forces `AI_PROVIDER=heuristic`, defaults to `HARNESS_MODE=stage1`, and sends `POST /api/control/play` to the dashboard/control server. The server spawns the harness run and records evidence under the chosen `--run-id`.
+
+### Common options
+
+```text
+--max-steps N       Number of decision/action steps before the run stops.
+--run-id ID         Evidence directory name under runs/. Use a new ID per run.
+--port N            Dashboard port for play, llm, or ui. Defaults to 3030.
+--yes               Required for destructive cleanup commands.
+```
+
+### Control server HTTP API
+
+The dashboard on `:3030` is also the harness control server. `poke` commands use these endpoints when possible:
+
+| Endpoint | Meaning |
+| --- | --- |
+| `GET /api/control/status` | Current active run, last run, and whether a child harness process is running. |
+| `POST /api/control/play` | Start a map-aware heuristic run. JSON body accepts `maxSteps`, `runId`, and `mode`. |
+| `POST /api/control/llm` | Start an OpenAI-compatible LLM run. JSON body accepts `maxSteps`, `runId`, and `mode`. |
+| `POST /api/control/press` | Send one manual safe button via a short child harness command. JSON body accepts `button` and `frames`. |
+| `POST /api/control/stop` | Stop the active child harness process. |
+| `POST /api/control/clean-failed` | Delete non-completed run directories from `runs/`. |
+
+`mGBA-http` remains the low-level emulator bridge. The dashboard/control server is the higher-level run manager that knows about run IDs, policies, evidence, and active child harness processes.
+
+### What `play` does internally
+
+`play` roughly does this:
+
+```text
+try GET http://127.0.0.1:3030/api/control/status
+if compatible control server exists:
+  POST /api/control/play { maxSteps, runId, mode: "stage1" }
+else:
+  start dashboard/control server, then POST /api/control/play
+```
+
+The lower-level equivalent remains available when you do not want the HTTP control server:
+
+```bash
+npm run harness -- map-heuristic --with-dashboard --mode stage1 --max-steps 100 --run-id map-1
+```
+
+The map-aware heuristic reads Red/Blue WRAM map structure (`wOverworldMap`, current map width/height, current block coordinates, and neighboring direction candidates). It explores with directional inputs first and only presses `A` in normal overworld movement when the tile/block in front is treated as an interaction candidate. Text boxes, menus, and battles still use prompt/battle-specific controls.
+
+### What stays outside the wrapper
+
+You still need to keep these running manually:
+
+- mGBA app with the ROM loaded.
+- `mGBASocketServer.lua` loaded in mGBA's scripting window.
+- `mGBA-http` listening at `MGBA_HTTP_BASE_URL`.
+
+If `status` fails with `MGBA_UNAVAILABLE`, fix the emulator/mGBA-http/Lua chain first before running `play` or `llm`.
+
 ## CLI Commands
 
 Show help:
@@ -87,6 +186,14 @@ Run mGBA preflight against your already running mGBA-http service:
 ```bash
 npm run harness -- preflight
 ```
+
+Start a local dashboard for live game screen, RAM state, and harness evidence events:
+
+```bash
+npm run dashboard -- --port 3030
+```
+
+Open `http://127.0.0.1:3030`. Keep mGBA, `mGBASocketServer.lua`, and mGBA-http running; the dashboard polls mGBA-http for screenshots/state and reads `runs/` for recent decisions/actions. It also surfaces Pokemon-specific improvement telemetry such as route context, map/x/y/facing, battle HP, screen text, selected action, confidence, checkpoint progress, repeated-state signals, and fallback/low-confidence markers.
 
 Start the Stage 1 harness loop with the local heuristic policy:
 

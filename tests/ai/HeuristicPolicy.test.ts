@@ -538,4 +538,93 @@ describe("HeuristicPolicy", () => {
       expect(decision.observedStateCitations.some((citation) => citation.startsWith("wIsInBattle="))).toBe(true);
     }
   });
+
+  it("uses RAM map structure to choose an in-bounds unexplored direction after repeated coordinate stalls", async () => {
+    const policy = new HeuristicPolicy();
+    const mapAwareState: PokemonStateSnapshot = {
+      ...baseState,
+      wCurMap: 2,
+      wYCoord: 4,
+      wXCoord: 4,
+      mapStructure: {
+        mapId: 2,
+        width: 8,
+        height: 8,
+        stride: 14,
+        tileset: 1,
+        currentViewPointer: 0xc5d0,
+        currentBlockRow: 5,
+        currentBlockCol: 5,
+        currentBlockId: 0x22,
+        visibleBlocks: [[0x22]],
+        directionCandidates: [
+          { direction: "up", targetY: 3, targetX: 4, targetBlockRow: 4, targetBlockCol: 5, blockId: 0x22, inBounds: true },
+          { direction: "right", targetY: 4, targetX: 5, targetBlockRow: 5, targetBlockCol: 5, blockId: 0x22, inBounds: true },
+          { direction: "down", targetY: 5, targetX: 4, targetBlockRow: 5, targetBlockCol: 5, blockId: 0x22, inBounds: true },
+          { direction: "left", targetY: 4, targetX: 3, targetBlockRow: 5, targetBlockCol: 4, blockId: 0x31, inBounds: true }
+        ]
+      }
+    };
+
+    const decision = await policy.chooseAction({
+      state: mapAwareState,
+      recentStates: [mapAwareState, mapAwareState],
+      recentActions: [{ action: { type: "hold", button: "Up", frames: 18 } }]
+    });
+
+    expect(decision.action).toEqual({ type: "hold", button: "Left", frames: 18 });
+    expect(decision.rationale).toContain("Map RAM shows 8x8 block map");
+    expect(decision.observedStateCitations).toContain(
+      "mapStructure=8x8;currentBlock=0x22;candidates=up:in:0x22,right:in:0x22,down:in:0x22,left:in:0x31"
+    );
+  });
+
+
+  it("explores by map structure before pressing A, then interacts only when facing an interaction candidate", async () => {
+    const policy = new HeuristicPolicy();
+    const mapAwareState: PokemonStateSnapshot = {
+      ...baseState,
+      wCurMap: 2,
+      wYCoord: 4,
+      wXCoord: 4,
+      playerFacingDirection: "up",
+      mapStructure: {
+        mapId: 2,
+        width: 8,
+        height: 8,
+        stride: 14,
+        tileset: 1,
+        currentViewPointer: 0xc5d0,
+        currentBlockRow: 5,
+        currentBlockCol: 5,
+        currentBlockId: 0x22,
+        visibleBlocks: [[0x22]],
+        directionCandidates: [
+          { direction: "up", targetY: 3, targetX: 4, targetBlockRow: 4, targetBlockCol: 5, blockId: 0x22, inBounds: true },
+          { direction: "right", targetY: 4, targetX: 5, targetBlockRow: 5, targetBlockCol: 5, blockId: 0x22, inBounds: true },
+          { direction: "down", targetY: 5, targetX: 4, targetBlockRow: 5, targetBlockCol: 5, blockId: 0x22, inBounds: true },
+          { direction: "left", targetY: 4, targetX: 3, targetBlockRow: 5, targetBlockCol: 4, blockId: 0x31, inBounds: true }
+        ]
+      }
+    };
+
+    const exploratoryDecision = await policy.chooseAction({
+      state: mapAwareState,
+      recentStates: [mapAwareState],
+      recentActions: [{ action: { type: "hold", button: "Up", frames: 18 } }]
+    });
+    const interactionDecision = await policy.chooseAction({
+      state: {
+        ...mapAwareState,
+        playerFacingDirection: "left"
+      },
+      recentStates: [mapAwareState, mapAwareState]
+    });
+
+    expect(exploratoryDecision.action).toEqual({ type: "hold", button: "Left", frames: 18 });
+    expect(exploratoryDecision.action).not.toEqual({ type: "press", button: "A", frames: 5 });
+    expect(interactionDecision.action).toEqual({ type: "press", button: "A", frames: 5 });
+    expect(interactionDecision.rationale).toContain("Only interact at a map-structure candidate");
+  });
+
 });

@@ -27,7 +27,7 @@ export interface ChatCompletionsClient {
 
 export interface ChatCompletionRequest {
   model: string;
-  temperature: number;
+  temperature?: number;
   messages: Array<{ role: "system" | "user"; content: string }>;
 }
 
@@ -109,11 +109,11 @@ export class LLMPolicy implements Policy {
     this.calls += 1;
 
     try {
-      const completion = await this.client.chat.completions.create({
+      const completion = await this.client.chat.completions.create(buildChatCompletionRequest({
         model: this.model,
         temperature: this.temperature,
         messages: buildMessages(input, this.harnessMode)
-      });
+      }));
       const content = completion.choices[0]?.message?.content;
 
       if (typeof content !== "string" || content.trim().length === 0) {
@@ -138,6 +138,18 @@ export class LLMPolicy implements Policy {
     const decision = await this.fallbackPolicy.chooseAction(input);
     return markFallbackDecision(decision, error.code);
   }
+}
+
+function buildChatCompletionRequest(request: Required<Pick<ChatCompletionRequest, "model" | "messages">> & { temperature: number }): ChatCompletionRequest {
+  if (!supportsTemperature(request.model)) {
+    return { model: request.model, messages: request.messages };
+  }
+
+  return request;
+}
+
+function supportsTemperature(model: string): boolean {
+  return !/^gpt-5(?:[\w.-]*)?$/i.test(model);
 }
 
 function getProviderOptions(config: HarnessConfig): Pick<LLMPolicyOptions, "apiKey" | "baseURL" | "model"> {

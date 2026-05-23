@@ -55,6 +55,35 @@ function overworldRange(overrides: Record<number, number> = {}): number[] {
   });
 }
 
+
+function mapHeaderRange(overrides: Record<number, number> = {}): number[] {
+  const currentViewPointer = map.wOverworldMap + 7 * 16 + 8;
+  return rangeBytes(map.wCurMap, map.wCurMapWidth - map.wCurMap + 1, {
+    [map.wCurMap]: 0x02,
+    [map.wCurrentTileBlockMapViewPointer]: currentViewPointer & 0xff,
+    [map.wCurrentTileBlockMapViewPointer + 1]: currentViewPointer >> 8,
+    [map.wYCoord]: 0x08,
+    [map.wXCoord]: 0x0b,
+    [map.wYBlockCoord]: 0x03,
+    [map.wXBlockCoord]: 0x04,
+    [map.wCurMapTileset]: 0x01,
+    [map.wCurMapHeight]: 0x09,
+    [map.wCurMapWidth]: 0x0a,
+    ...overrides
+  });
+}
+
+function overworldMapRange(): number[] {
+  const width = 10;
+  const height = 9;
+  const stride = width + 6;
+  const bytes = Array.from({ length: stride * (height + 6) }, (_value, index) => index & 0xff);
+  bytes[7 * stride + 8] = 0x44;
+  bytes[7 * stride + 9] = 0x45;
+  bytes[8 * stride + 8] = 0x54;
+  return bytes;
+}
+
 function partyRange(partyCount: number, currentHp = 45, maxHp = 50): number[] {
   return rangeBytes(map.wPartyCount, map.wPartyMon1MaxHP - map.wPartyCount + 2, {
     [map.wPartyCount]: partyCount,
@@ -87,6 +116,8 @@ function createStateClient(partyCount = 1, currentHp = 45, maxHp = 50): FakeRamC
       [rangeKey(map.wBattleMonHP, 2)]: [0x2d, 0x00],
       [rangeKey(map.wIsInBattle, map.wBattleType - map.wIsInBattle + 1)]: [0x00, 0x00, 0x00, 0x00],
       [rangeKey(map.wLetterPrintingDelayFlags, map.wXBlockCoord - map.wLetterPrintingDelayFlags + 1)]: overworldRange(),
+      [rangeKey(map.wCurMap, map.wCurMapWidth - map.wCurMap + 1)]: mapHeaderRange(),
+      [rangeKey(map.wOverworldMap, overworldMapRange().length)]: overworldMapRange(),
       [rangeKey(map.wPartyCount, map.wPartyMon1MaxHP - map.wPartyCount + 2)]: partyRange(partyCount, currentHp, maxHp),
       [rangeKey(map.wTileMap, map.wTileMapLength)]: tileMapBytes("Hello there! Welcome to the world of POKEMON!")
     }
@@ -167,7 +198,17 @@ describe("PokemonStateReader", () => {
       x: 11,
       menuItem: 2,
       textBoxId: 0,
-      letterDelayFlags: 1
+      letterDelayFlags: 1,
+      mapStructure: {
+        mapId: 2,
+        width: 10,
+        height: 9,
+        stride: 16,
+        tileset: 1,
+        currentBlockRow: 7,
+        currentBlockCol: 8,
+        currentBlockId: 0x44
+      }
     });
 
     expect(client.calls).toEqual(expect.arrayContaining([
@@ -179,6 +220,8 @@ describe("PokemonStateReader", () => {
       { method: "readRange", address: map.wLetterPrintingDelayFlags, length: map.wXBlockCoord - map.wLetterPrintingDelayFlags + 1 },
       { method: "readRange", address: map.wPartyCount, length: map.wPartyMon1MaxHP - map.wPartyCount + 2 },
       { method: "readRange", address: map.wTileMap, length: map.wTileMapLength },
+      { method: "readRange", address: map.wCurMap, length: map.wCurMapWidth - map.wCurMap + 1 },
+      { method: "readRange", address: map.wOverworldMap, length: overworldMapRange().length },
       { method: "read8", address: map.wSpritePlayerStateData1FacingDirection },
       { method: "read8", address: map.wCurrentMenuItem },
       { method: "read8", address: map.wTextBoxID },
@@ -188,6 +231,28 @@ describe("PokemonStateReader", () => {
       { method: "read8", address: map.wNamingScreenType }
     ]));
     expect(client.calls).not.toContainEqual(expect.objectContaining({ method: "read16" }));
+  });
+
+
+
+  it("reads WRAM map structure blocks around the player for map-aware heuristics", async () => {
+    const reader = new PokemonStateReader({ client: createStateClient(), version: "red" });
+
+    await expect(reader.readMapStructureState()).resolves.toMatchObject({
+      mapId: 2,
+      width: 10,
+      height: 9,
+      stride: 16,
+      tileset: 1,
+      currentBlockRow: 7,
+      currentBlockCol: 8,
+      currentBlockId: 0x44,
+      visibleBlocks: expect.arrayContaining([expect.arrayContaining([0x44, 0x45])]),
+      directionCandidates: expect.arrayContaining([
+        expect.objectContaining({ direction: "right", targetY: 8, targetX: 12, targetBlockRow: 7, targetBlockCol: 9, blockId: 0x45, inBounds: true }),
+        expect.objectContaining({ direction: "down", targetY: 9, targetX: 11, targetBlockRow: 7, targetBlockCol: 8, blockId: 0x44, inBounds: true })
+      ])
+    });
   });
 
   it("derives Hall of Fame completion from the observed map id without memory writes", async () => {

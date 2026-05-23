@@ -93,6 +93,10 @@ export class EvidenceRecorder {
     return file;
   }
 
+  async recordTelemetry(telemetry: unknown): Promise<void> {
+    await this.appendEvent("pokemon_telemetry", telemetry);
+  }
+
   async recordError(error: unknown): Promise<string> {
     const sequence = ++this.errorCount;
     const file = this.paths.errorFile(sequence);

@@ -17,10 +17,16 @@ export const RED_BLUE_MEMORY_MAP = {
   wPartyMon1MaxHP: 0xd18d,
   wObtainedBadges: 0xd356,
   wCurMap: 0xd35e,
+  wCurrentTileBlockMapViewPointer: 0xd35f,
   wYCoord: 0xd361,
   wXCoord: 0xd362,
   wYBlockCoord: 0xd363,
   wXBlockCoord: 0xd364,
+  wCurMapTileset: 0xd365,
+  wCurMapHeight: 0xd366,
+  wCurMapWidth: 0xd367,
+  wOverworldMap: 0xc580,
+  wOverworldMapLength: 1300,
   wLetterPrintingDelayFlags: 0xd358
 } as const;
 
@@ -46,8 +52,14 @@ export const wPartyMon1HP = RED_BLUE_MEMORY_MAP.wPartyMon1HP;
 export const wPartyMon1MaxHP = RED_BLUE_MEMORY_MAP.wPartyMon1MaxHP;
 export const wObtainedBadges = RED_BLUE_MEMORY_MAP.wObtainedBadges;
 export const wCurMap = RED_BLUE_MEMORY_MAP.wCurMap;
+export const wCurrentTileBlockMapViewPointer = RED_BLUE_MEMORY_MAP.wCurrentTileBlockMapViewPointer;
 export const wYCoord = RED_BLUE_MEMORY_MAP.wYCoord;
 export const wXCoord = RED_BLUE_MEMORY_MAP.wXCoord;
 export const wYBlockCoord = RED_BLUE_MEMORY_MAP.wYBlockCoord;
 export const wXBlockCoord = RED_BLUE_MEMORY_MAP.wXBlockCoord;
+export const wCurMapTileset = RED_BLUE_MEMORY_MAP.wCurMapTileset;
+export const wCurMapHeight = RED_BLUE_MEMORY_MAP.wCurMapHeight;
+export const wCurMapWidth = RED_BLUE_MEMORY_MAP.wCurMapWidth;
+export const wOverworldMap = RED_BLUE_MEMORY_MAP.wOverworldMap;
+export const wOverworldMapLength = RED_BLUE_MEMORY_MAP.wOverworldMapLength;
 export const wLetterPrintingDelayFlags = RED_BLUE_MEMORY_MAP.wLetterPrintingDelayFlags;

@@ -1,3 +1,5 @@
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { HarnessError } from "../../src/errors.js";
 import { MgbaHttpClient, type MgbaFetch } from "../../src/mgba/MgbaHttpClient.js";
@@ -40,7 +42,7 @@ describe("MgbaHttpClient", () => {
     await expect(client.readRange(0xd35e, 3)).resolves.toEqual(Uint8Array.from([0xd3, 0x00, 0xea]));
 
     expect(calls.map((call) => [call.method, pathAndQuery(call.url)])).toEqual([
-      ["GET", "/core/currentframe"],
+      ["GET", "/core/currentFrame"],
       ["GET", "/core/read8?address=0xD35E"],
       ["GET", "/core/read16?address=0xD16C"],
       ["GET", "/core/readrange?address=0xD35E&length=3"]
@@ -80,7 +82,7 @@ describe("MgbaHttpClient", () => {
 
     await expect(client.currentFrame()).rejects.toMatchObject({
       code: "MGBA_UNAVAILABLE",
-      safeContext: { endpoint: "/core/currentframe", status: 500, statusText: "Internal Server Error" }
+      safeContext: { endpoint: "/core/currentFrame", status: 500, statusText: "Internal Server Error" }
     });
 
     try {
@@ -122,6 +124,55 @@ describe("MgbaHttpClient", () => {
       fetchImpl: async () => createResponse("not,bytes")
     });
     await expect(invalidRangeClient.readRange(0xd35e, 2)).rejects.toMatchObject({ code: "MGBA_UNAVAILABLE" });
+  });
+
+  it("serializes concurrent requests because mGBA Lua socket handles one command at a time", async () => {
+    let activeRequests = 0;
+    let maxActiveRequests = 0;
+    const fetchImpl: MgbaFetch = async () => {
+      activeRequests += 1;
+      maxActiveRequests = Math.max(maxActiveRequests, activeRequests);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      activeRequests -= 1;
+      return createResponse("1");
+    };
+    const client = new MgbaHttpClient({ baseUrl: "http://127.0.0.1:5000", fetchImpl });
+
+    await expect(Promise.all([client.read8(0xd35e), client.read8(0xd35f), client.currentFrame()])).resolves.toEqual([1, 1, 1]);
+
+    expect(maxActiveRequests).toBe(1);
+  });
+
+  it("shares a filesystem lock across clients so dashboard polling cannot overlap harness RAM reads", async () => {
+    const requestLockDir = join(tmpdir(), `poke-pi-mgba-http-test-${process.pid}-${Date.now()}`);
+    let activeRequests = 0;
+    let maxActiveRequests = 0;
+    const fetchImpl: MgbaFetch = async () => {
+      activeRequests += 1;
+      maxActiveRequests = Math.max(maxActiveRequests, activeRequests);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      activeRequests -= 1;
+      return createResponse("1");
+    };
+    const harnessClient = new MgbaHttpClient({ baseUrl: "http://127.0.0.1:5000", fetchImpl, requestLockDir });
+    const dashboardClient = new MgbaHttpClient({ baseUrl: "http://127.0.0.1:5000", fetchImpl, requestLockDir });
+
+    await expect(Promise.all([harnessClient.read8(0xd35e), dashboardClient.currentFrame()])).resolves.toEqual([1, 1]);
+
+    expect(maxActiveRequests).toBe(1);
+  });
+
+  it("continues serializing later requests after a failed request", async () => {
+    const { fetchImpl, calls } = createFakeFetch(["boom", "7"]);
+    const client = new MgbaHttpClient({ baseUrl: "http://127.0.0.1:5000", fetchImpl });
+
+    await expect(client.read8(0xd35e)).rejects.toMatchObject({ code: "MGBA_UNAVAILABLE" });
+    await expect(client.read8(0xd35f)).resolves.toBe(7);
+
+    expect(calls.map((call) => pathAndQuery(call.url))).toEqual([
+      "/core/read8?address=0xD35E",
+      "/core/read8?address=0xD35F"
+    ]);
   });
 
   it("uses screenshot-specific error code for screenshot failures", async () => {
