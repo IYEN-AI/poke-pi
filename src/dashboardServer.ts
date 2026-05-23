@@ -113,7 +113,7 @@ async function routeRequest(input: {
 
     if (url.pathname === "/api/screenshot" || url.pathname === "/api/screen") {
       const screenshotPath = path.join(liveDir, "latest.png");
-      const servedPath = await captureLiveScreenshotOrLatestEvidence(client, screenshotPath, config.evidenceDir);
+      const servedPath = await captureLiveScreenshotOrLatestEvidence(client, screenshotPath, config.evidenceDir, { preferEvidence: control.isRunning() });
       await sendFile(response, servedPath, "image/png");
       return;
     }
@@ -169,6 +169,10 @@ class DashboardControl {
       activeRun: this.activeRun,
       lastRun: this.lastRun
     };
+  }
+
+  isRunning(): boolean {
+    return this.child !== undefined;
   }
 
   start(options: ControlRunOptions): unknown {
@@ -418,7 +422,19 @@ function modeField(value: unknown): HarnessMode | undefined {
   return mode === "stage1" || mode === "full-game" ? mode : undefined;
 }
 
-async function captureLiveScreenshotOrLatestEvidence(client: MgbaHttpClient, liveScreenshotPath: string, evidenceDir: string): Promise<string> {
+async function captureLiveScreenshotOrLatestEvidence(
+  client: MgbaHttpClient,
+  liveScreenshotPath: string,
+  evidenceDir: string,
+  options: { readonly preferEvidence?: boolean } = {}
+): Promise<string> {
+  if (options.preferEvidence === true) {
+    const latest = await findLatestEvidenceScreenshot(evidenceDir);
+    if (latest !== undefined) {
+      return latest;
+    }
+  }
+
   try {
     return await client.screenshot(liveScreenshotPath);
   } catch (error) {
@@ -745,6 +761,7 @@ const $ = (id) => document.getElementById(id);
 let selectedRun = null;
 let config = null;
 let lastScreenOkAt = null;
+let screenInFlight = false;
 
 async function getJson(url) {
   const res = await fetch(url, { cache: 'no-store' });
@@ -841,9 +858,11 @@ function renderMapStructure(live) {
 }
 async function refreshConfig() { config = await getJson('/api/config'); }
 function refreshScreen() {
+  if (screenInFlight) return;
+  screenInFlight = true;
   const img = $('screen');
-  img.onload = () => { lastScreenOkAt = new Date(); $('screenMeta').textContent = 'screen refreshed · ' + lastScreenOkAt.toLocaleTimeString(); };
-  img.onerror = () => setStatus('screen unavailable', false);
+  img.onload = () => { screenInFlight = false; lastScreenOkAt = new Date(); $('screenMeta').textContent = 'screen refreshed · ' + lastScreenOkAt.toLocaleTimeString(); };
+  img.onerror = () => { screenInFlight = false; setStatus('screen unavailable', false); };
   img.src = '/api/screen?t=' + Date.now();
 }
 async function refreshLive() {
@@ -878,10 +897,10 @@ $('controlCleanFailed').addEventListener('click', () => void controlCleanFailed(
 (async function main() {
   try { await refreshConfig(); await refreshControl(); await refreshRuns(); refreshScreen(); setStatus('connected to ' + config.mgbaHttpBaseUrl); }
   catch (e) { setStatus(String(e), false); }
-  setInterval(refreshScreen, 500);
-  setInterval(() => refreshLive().then(() => setStatus('live')).catch(e => setStatus('RAM unavailable; screen may use latest frame', false)), 1500);
-  setInterval(() => refreshControl().catch(e => setStatus(String(e), false)), 1500);
-  setInterval(() => refreshRuns().catch(e => setStatus(String(e), false)), 2500);
+  setInterval(refreshScreen, 1000);
+  setInterval(() => refreshLive().then(() => setStatus('live')).catch(e => setStatus('RAM unavailable; screen may use latest frame', false)), 2500);
+  setInterval(() => refreshControl().catch(e => setStatus(String(e), false)), 2000);
+  setInterval(() => refreshRuns().catch(e => setStatus(String(e), false)), 3500);
 })();
 </script>
 </body>
