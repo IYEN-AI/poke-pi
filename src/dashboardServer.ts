@@ -543,7 +543,14 @@ function dashboardHtml(): string {
     section { background: #131a2e; border: 1px solid #26304d; border-radius: 14px; padding: 12px; margin-bottom: 12px; }
     h2, h3 { margin: 0 0 10px; font-size: 14px; }
     pre { white-space: pre-wrap; word-break: break-word; overflow: auto; max-height: 260px; background: #070b15; border: 1px solid #202942; border-radius: 10px; padding: 10px; font-size: 12px; }
-    select, button { background: #10172a; color: #e7ecff; border: 1px solid #334061; border-radius: 8px; padding: 8px 10px; max-width: 100%; }
+    input, select, button { background: #10172a; color: #e7ecff; border: 1px solid #334061; border-radius: 8px; padding: 8px 10px; max-width: 100%; }
+    input { min-width: 0; }
+    button { cursor: pointer; }
+    button:hover { border-color: #5a7cff; background: #17213a; }
+    button.danger { border-color: #8f3c3c; }
+    button.ok { border-color: #3c8f66; }
+    .field { display: grid; gap: 4px; flex: 1 1 120px; }
+    .field label { color: #9aa7ca; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; }
     .events { max-height: 360px; overflow: auto; display: flex; flex-direction: column; gap: 8px; }
     .event { border-left: 4px solid #5a7cff; padding: 8px 10px; background: #0f1628; border-radius: 8px; font-size: 12px; }
     .event.action { border-color: #62d394; }
@@ -566,6 +573,24 @@ function dashboardHtml(): string {
     </div>
     <aside>
       <section>
+        <h2>Control server</h2>
+        <div class="toolbar">
+          <div class="field"><label for="controlRunId">Run ID</label><input id="controlRunId" placeholder="auto timestamp" /></div>
+          <div class="field"><label for="controlMaxSteps">Max steps</label><input id="controlMaxSteps" type="number" min="1" step="1" value="100" /></div>
+          <div class="field"><label for="controlMode">Mode</label><select id="controlMode"><option value="stage1">stage1</option><option value="full-game">full-game</option></select></div>
+        </div>
+        <div class="toolbar" style="margin-top: 10px;">
+          <button class="ok" id="controlPlay">Play heuristic</button>
+          <button class="ok" id="controlLlm">LLM run</button>
+          <button class="danger" id="controlStop">Stop active</button>
+          <button id="controlCleanFailed">Clean failed</button>
+        </div>
+        <div class="hud" id="controlSummary" style="grid-template-columns: repeat(2, minmax(0, 1fr)); margin-top: 10px;"></div>
+        <h3 style="margin-top: 12px;">Manual input</h3>
+        <div class="toolbar" id="manualButtons"></div>
+        <pre id="controlResponse">ready</pre>
+      </section>
+      <section>
         <h2>Harness run</h2>
         <div class="toolbar">
           <select id="runs"></select>
@@ -576,6 +601,7 @@ function dashboardHtml(): string {
       <section><h3>Last LLM decision</h3><pre id="lastDecision">none</pre></section>
       <section><h3>Last button action</h3><pre id="lastAction">none</pre></section>
       <section><h3>Improvement log</h3><div class="events" id="improvementLog"></div></section>
+      <section><h3>Map structure</h3><div class="hud" id="mapSummary" style="grid-template-columns: repeat(2, minmax(0, 1fr));"></div><pre id="mapCandidates">waiting for RAM...</pre></section>
       <section><h3>Live RAM snapshot</h3><pre id="liveState">loading...</pre></section>
       <section><h3>Recent events</h3><div class="events" id="events"></div></section>
     </aside>
@@ -590,6 +616,16 @@ async function getJson(url) {
   const res = await fetch(url, { cache: 'no-store' });
   if (!res.ok) throw new Error(url + ' -> ' + res.status);
   return res.json();
+}
+async function postJson(url, body = {}) {
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(url + ' -> ' + res.status + ' ' + j(data));
+  return data;
 }
 function j(value) { return JSON.stringify(value ?? null, null, 2); }
 function setStatus(text, ok = true) { $('status').textContent = text; $('status').style.borderColor = ok ? '#3c8f66' : '#a34b4b'; }
@@ -608,6 +644,72 @@ function compactState(s) {
 function renderMetrics(id, obj) {
   $(id).innerHTML = Object.entries(obj ?? {}).map(([k,v]) => '<div class="metric"><div class="label">' + escapeHtml(k) + '</div><strong>' + escapeHtml(String(v ?? '')) + '</strong></div>').join('');
 }
+function runRequestBody(kind) {
+  const runId = $('controlRunId').value.trim() || kind + '-' + Date.now();
+  const maxSteps = Number($('controlMaxSteps').value || 100);
+  return { runId, maxSteps, mode: $('controlMode').value };
+}
+async function refreshControl() {
+  const control = await getJson('/api/control/status');
+  renderMetrics('controlSummary', {
+    running: control.running ? 'yes' : 'no',
+    active: control.activeRun?.runId ?? 'none',
+    kind: control.activeRun?.kind ?? control.lastRun?.kind ?? 'none',
+    pid: control.activeRun?.pid ?? 'none',
+    last: control.lastRun?.runId ?? 'none',
+    signal: control.lastRun?.signal ?? control.lastRun?.code ?? 'none'
+  });
+  return control;
+}
+async function controlStart(kind) {
+  const body = runRequestBody(kind);
+  $('controlResponse').textContent = 'starting ' + kind + '...';
+  const result = await postJson('/api/control/' + kind, body);
+  selectedRun = body.runId;
+  $('controlResponse').textContent = j(result);
+  await refreshControl();
+  await refreshRuns();
+}
+async function controlStop() {
+  $('controlResponse').textContent = 'stopping...';
+  const result = await postJson('/api/control/stop');
+  $('controlResponse').textContent = j(result);
+  await refreshControl();
+  await refreshRuns();
+}
+async function controlCleanFailed() {
+  $('controlResponse').textContent = 'cleaning failed runs...';
+  const result = await postJson('/api/control/clean-failed');
+  $('controlResponse').textContent = j(result);
+  await refreshRuns();
+}
+async function controlPress(button) {
+  $('controlResponse').textContent = 'pressing ' + button + '...';
+  const result = await postJson('/api/control/press', { button, frames: 5 });
+  $('controlResponse').textContent = j(result);
+}
+function renderMapStructure(live) {
+  const map = live?.state?.mapStructure;
+  if (!map) {
+    renderMetrics('mapSummary', { available: 'no' });
+    $('mapCandidates').textContent = 'map RAM unavailable';
+    return;
+  }
+  renderMetrics('mapSummary', {
+    available: 'yes',
+    size: String(map.width ?? '?') + 'x' + String(map.height ?? '?'),
+    tileset: map.tileset ?? '?',
+    block: map.currentBlock?.id ?? '?',
+    row: map.currentBlock?.row ?? '?',
+    col: map.currentBlock?.col ?? '?',
+    pointer: map.currentViewPointer ?? '?'
+  });
+  $('mapCandidates').textContent = j({
+    currentBlock: map.currentBlock,
+    directionCandidates: map.directionCandidates,
+    visibleBlocks: map.visibleBlocks
+  });
+}
 async function refreshConfig() { config = await getJson('/api/config'); }
 function refreshScreen() {
   const img = $('screen');
@@ -618,6 +720,7 @@ function refreshScreen() {
 async function refreshLive() {
   const live = await getJson('/api/live');
   renderMetrics('quickState', compactState(live));
+  renderMapStructure(live);
   $('liveState').textContent = j(live.state);
   if (lastScreenOkAt) $('screenMeta').textContent = 'frame ' + live.frame + ' · screen ' + lastScreenOkAt.toLocaleTimeString() + ' · state ' + live.readAt;
 }
@@ -639,11 +742,21 @@ async function refreshRun() {
 function escapeHtml(text) { return String(text).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 $('runs').addEventListener('change', () => { selectedRun = $('runs').value; void refreshRun(); });
 $('refreshRuns').addEventListener('click', () => void refreshRuns());
+$('controlPlay').addEventListener('click', () => void controlStart('play').catch(e => { setStatus(String(e), false); $('controlResponse').textContent = String(e); }));
+$('controlLlm').addEventListener('click', () => void controlStart('llm').catch(e => { setStatus(String(e), false); $('controlResponse').textContent = String(e); }));
+$('controlStop').addEventListener('click', () => void controlStop().catch(e => { setStatus(String(e), false); $('controlResponse').textContent = String(e); }));
+$('controlCleanFailed').addEventListener('click', () => void controlCleanFailed().catch(e => { setStatus(String(e), false); $('controlResponse').textContent = String(e); }));
+$('manualButtons').innerHTML = ['A','B','Start','Select','Up','Down','Left','Right'].map(button => '<button data-button="' + button + '">' + button + '</button>').join('');
+$('manualButtons').addEventListener('click', (event) => {
+  const button = event.target?.dataset?.button;
+  if (button) void controlPress(button).catch(e => { setStatus(String(e), false); $('controlResponse').textContent = String(e); });
+});
 (async function main() {
-  try { await refreshConfig(); await refreshRuns(); refreshScreen(); setStatus('connected to ' + config.mgbaHttpBaseUrl); }
+  try { await refreshConfig(); await refreshControl(); await refreshRuns(); refreshScreen(); setStatus('connected to ' + config.mgbaHttpBaseUrl); }
   catch (e) { setStatus(String(e), false); }
   setInterval(refreshScreen, 500);
   setInterval(() => refreshLive().then(() => setStatus('live')).catch(e => setStatus('RAM unavailable; screen may use latest frame', false)), 1500);
+  setInterval(() => refreshControl().catch(e => setStatus(String(e), false)), 1500);
   setInterval(() => refreshRuns().catch(e => setStatus(String(e), false)), 2500);
 })();
 </script>
