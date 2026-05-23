@@ -43,6 +43,7 @@ export interface StrategyLoopResult {
 type Phase = "scout" | "generated" | "llm";
 
 const DEFAULT_SLEEP = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+const MAX_GENERATED_POLICY_OBJECTIVE_LENGTH = 500;
 
 export async function runStrategyLoop(options: StrategyLoopOptions): Promise<StrategyLoopResult> {
   const request = options.request ?? defaultControlRequest;
@@ -75,7 +76,7 @@ export async function runStrategyLoop(options: StrategyLoopOptions): Promise<Str
         fromRun: runId,
         policyId,
         policyFile,
-        objective: options.objective ?? strategyObjective(phase, evaluation.body, latestMovementFeedback)
+        objective: fitGeneratedPolicyObjective(options.objective ?? strategyObjective(phase, evaluation.body, latestMovementFeedback))
       }, "POST");
       if (synthesis.status >= 400) {
         options.log?.({ type: "policy_synthesis_failed", iteration, runId, policyFile, detail: synthesis.body });
@@ -96,7 +97,8 @@ function choosePhase(input: { readonly iteration: number; readonly currentPolicy
     return "scout";
   }
 
-  if (movementQuality(input.movementFeedback) === "blocked") {
+  const quality = movementQuality(input.movementFeedback);
+  if (quality === "blocked" || quality === "oscillating") {
     return "llm";
   }
 
@@ -161,6 +163,14 @@ function shouldSynthesizePolicy(phase: Phase, evaluation: unknown): boolean {
 
   const recommendation = objectField(evaluation, "recommendation");
   return recommendation !== "promote_or_reuse_policy";
+}
+
+function fitGeneratedPolicyObjective(objective: string): string {
+  if (objective.length <= MAX_GENERATED_POLICY_OBJECTIVE_LENGTH) {
+    return objective;
+  }
+
+  return objective.slice(0, MAX_GENERATED_POLICY_OBJECTIVE_LENGTH - 1).trimEnd() + ".";
 }
 
 function strategyObjective(phase: Phase, evaluation: unknown, movementFeedback?: unknown): string {

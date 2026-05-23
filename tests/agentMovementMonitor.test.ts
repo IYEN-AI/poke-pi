@@ -28,6 +28,27 @@ describe("movement monitor", () => {
     expect(feedback?.recentExperiences.at(-1)).toMatchObject({ step: 4, kind: "blocked_with_visual_change" });
   });
 
+  it("detects two-tile walk-step ping-pong as oscillation instead of progress", async () => {
+    const evidenceDir = await mkdtemp(path.join(os.tmpdir(), "poke-movement-"));
+    const runId = "oscillating-run";
+    await writeEvents(evidenceDir, runId, [
+      postAction(1, "Right", "walk_step", { x: 10, y: 24 }, { x: 11, y: 24 }),
+      postAction(2, "Left", "walk_step", { x: 11, y: 24 }, { x: 10, y: 24 }),
+      postAction(3, "Right", "walk_step", { x: 10, y: 24 }, { x: 11, y: 24 }),
+      postAction(4, "Left", "walk_step", { x: 11, y: 24 }, { x: 10, y: 24 }),
+      postAction(5, "Right", "walk_step", { x: 10, y: 24 }, { x: 11, y: 24 }),
+      postAction(6, "Left", "walk_step", { x: 11, y: 24 }, { x: 10, y: 24 })
+    ]);
+
+    const feedback = await buildMovementFeedback(evidenceDir, runId);
+
+    expect(feedback).toMatchObject({
+      counts: { walk_step: 6 },
+      movementQuality: "oscillating",
+      recommendation: "avoid_two_tile_ping_pong_and_request_visual_route_with_forward_progress"
+    });
+  });
+
   it("polls the control server status and writes latest feedback for the active run", async () => {
     const evidenceDir = await mkdtemp(path.join(os.tmpdir(), "poke-movement-"));
     const runId = "active-run";
@@ -57,16 +78,22 @@ async function writeEvents(evidenceDir: string, runId: string, events: readonly 
   await writeFile(path.join(runDir, "events.jsonl"), `${events.map((event) => JSON.stringify(event)).join("\n")}\n`, "utf8");
 }
 
-function postAction(step: number, button: string, kind: string): unknown {
+function postAction(
+  step: number,
+  button: string,
+  kind: string,
+  beforePosition: { readonly x: number; readonly y: number } = { x: 4, y: 5 },
+  afterPosition: { readonly x: number; readonly y: number } = { x: 4, y: kind === "walk_step" ? 6 : 5 }
+): unknown {
   return {
     type: "pokemon_telemetry",
     payload: {
       schema: "pokemon-post-action-observation.v1",
       step,
       action: { type: "press", button, frames: 8 },
-      before: { map: 1, x: 4, y: 5 },
-      after: { map: 1, x: 4, y: kind === "walk_step" ? 6 : 5 },
-      change: { kind, delta: { dx: 0, dy: kind === "walk_step" ? 1 : 0 }, pixelChanged: kind !== "no_change" }
+      before: { mapId: 1, x: beforePosition.x, y: beforePosition.y },
+      after: { mapId: 1, x: afterPosition.x, y: afterPosition.y },
+      change: { kind, delta: { dx: afterPosition.x - beforePosition.x, dy: afterPosition.y - beforePosition.y }, pixelChanged: kind !== "no_change" }
     }
   };
 }
