@@ -122,10 +122,10 @@ npm run poke -- stop
 | `npm run poke -- synthesize-policy --from-run scout-1 --policy-id pallet-v1` | Creates `policies/generated/pallet-v1.json`, a schema-validated heuristic policy DSL artifact. | Let Hermes turn scout logs into a new executable heuristic. |
 | `npm run poke -- play-policy --policy-file policies/generated/pallet-v1.json --run-id exec-1` | Executes a generated JSON heuristic policy through the normal harness runner. | Validate synthesized policies before using expensive LLM execution. |
 | `npm run poke -- llm --max-steps 100 --run-id llm-1 --policy-file policies/generated/pallet-v1.json` | Runs Stage 1 through the configured OpenAI-compatible provider and optionally injects a generated policy as a guide. | Use LLM for higher-cost execution while respecting Hermes' synthesized heuristic recommendation. |
-| `npm run poke -- strategy-bg --iterations 12 --max-steps 80 --llm-every 4` | Starts a detached strategy loop that polls the control server, runs scout/generated/LLM phases, evaluates results, and updates generated policies. | Let the repo keep improving policies in the background. |
-| `npm run poke -- strategy-loop --iterations 4 --max-steps 60` | Same strategy loop in the foreground with event logs printed to stdout. | Debug the background strategist. |
-| `npm run poke -- movement-monitor-bg --iterations 3600 --poll-ms 1000` | Starts a detached external observer that watches active runs, classifies movement outcomes, and writes `runs/.movement-feedback/latest.json`. | Give the strategy loop/Hermes a second-loop critique of whether movement is actually progressing. |
-| `npm run poke -- movement-monitor --iterations 120 --poll-ms 1000` | Same movement monitor in the foreground with feedback events printed to stdout. | Debug blocked movement, wall pushes, and map transitions. |
+| `npm run poke -- progress-bg --iterations 12 --max-steps 80 --llm-every 4` | Starts a detached progression loop that polls the control server, runs scout/generated/LLM phases, evaluates results, and updates generated policies. | Let the repo keep improving policies in the background. |
+| `npm run poke -- progress --iterations 4 --max-steps 60` | Same progression loop in the foreground with event logs printed to stdout. | Debug the background progressor. |
+| `npm run poke -- critic-bg --iterations 3600 --poll-ms 1000` | Starts a detached external observer that watches active runs, classifies movement outcomes, and writes `runs/.movement-feedback/latest.json`. | Give the progression loop/Hermes a second-loop critique of whether movement is actually progressing. |
+| `npm run poke -- critic --iterations 120 --poll-ms 1000` | Same movement critic in the foreground with feedback events printed to stdout. | Debug blocked movement, wall pushes, and map transitions. |
 | `npm run poke -- ui --port 3030` | Starts only the web dashboard/control server. | Watch screen/RAM/telemetry, start heuristic or LLM agent runs, and stop the active run. |
 | `npm run poke -- press A --frames 5` | Sends one safe manual button input. | Smoke checks or unblocking a prompt manually. |
 | `npm run poke -- stop` | Stops repo-started Node harness/dashboard processes. Leaves mGBA and mGBA-http alone. | Cleanly stop automation without closing the emulator. |
@@ -144,14 +144,14 @@ npm run poke -- stop
 --policy-id ID      Generated policy artifact id.
 --policy-file FILE  Generated policy JSON path.
 --objective TEXT    Optional policy synthesis objective.
---iterations N      Number of strategy loop phases to run.
---poll-ms N         Strategy loop polling interval while a child run is active.
---llm-every N       Run an LLM-guided phase every N strategy iterations after a policy exists.
---run-id-prefix ID  Prefix for strategy-generated run IDs.
+--iterations N      Number of progression loop phases or critic polls to run.
+--poll-ms N         Progression/critic polling interval while a child run is active.
+--llm-every N       Run an LLM-guided phase every N progression iterations after a policy exists.
+--run-id-prefix ID  Prefix for progression-generated run IDs.
 --yes               Required for destructive cleanup commands.
 ```
 
-Movement-monitor options use `--iterations`, `--poll-ms`, and `--port` too. The monitor is read-only: it watches the control server plus run evidence and never sends inputs.
+Critic options use `--iterations`, `--poll-ms`, and `--port` too. The critic is read-only: it watches the control server plus run evidence and never sends inputs. Legacy names (`strategy-loop`, `strategy-bg`, `movement-monitor`, and `movement-monitor-bg`) still work, but new scripts should use `poke-pi:progress`, `poke-pi:progress:bg`, `poke-pi:critic`, and `poke-pi:critic:bg` npm scripts.
 
 ### Control server HTTP API
 
@@ -220,22 +220,22 @@ Scout runs collect map/action/outcome telemetry cheaply; Hermes can synthesize a
 Use this when you want the agent side to keep polling, running policies, and updating policy artifacts without manual intervention:
 
 ```bash
-npm run poke -- strategy-bg --iterations 12 --max-steps 80 --llm-every 4 --run-id-prefix bg-strategy
+npm run poke-pi:progress:bg -- --iterations 12 --max-steps 80 --llm-every 4 --run-id-prefix bg-strategy
 ```
 
 Shortcut npm scripts are available for this loop:
 
 ```bash
-npm run actor-critic:forever
-npm run actor-critic -- --iterations 4 --max-steps 60 --poll-ms 1000
-npm run actor-critic:bg -- --iterations 12 --max-steps 80 --llm-every 4 --run-id-prefix bg-strategy
-npm run actor-critic:monitor -- --iterations 3600 --poll-ms 1000
+npm run poke-pi:progress:forever
+npm run poke-pi:progress -- --iterations 4 --max-steps 60 --poll-ms 1000
+npm run poke-pi:progress:bg -- --iterations 12 --max-steps 80 --llm-every 4 --run-id-prefix bg-strategy
+npm run poke-pi:critic:bg -- --iterations 3600 --poll-ms 1000
 ```
 
-`actor-critic:forever` starts the movement monitor and then keeps the strategy loop running with large defaults. Override defaults with environment variables when needed:
+`poke-pi:progress:forever` starts the movement critic and then keeps the progression loop running with large defaults. Override defaults with environment variables when needed:
 
 ```bash
-MAX_STEPS=200 LLM_EVERY=6 RUN_ID_PREFIX=route1 npm run actor-critic:forever
+MAX_STEPS=200 LLM_EVERY=6 RUN_ID_PREFIX=route1 npm run poke-pi:progress:forever
 ```
 
 The detached process writes logs under `runs/.strategy/`. Its policy-selection strategy is:
@@ -252,20 +252,20 @@ If `runs/.movement-feedback/latest.json` exists, the strategy loop also reads th
 Foreground debug mode:
 
 ```bash
-npm run poke -- strategy-loop --iterations 4 --max-steps 60 --poll-ms 1000
+npm run poke -- progress --iterations 4 --max-steps 60 --poll-ms 1000
 ```
 
-The strategy loop still never sends manual gamepad input. It only starts harness runs and updates policy files; actual button actions are produced by the selected policy inside the harness.
+The progression loop still never sends manual gamepad input. It only starts harness runs and updates policy files; actual button actions are produced by the selected policy inside the harness.
 
 ### External movement feedback loop
 
-Run this alongside `strategy-bg` when you want a second loop watching whether selected policies are actually moving through the map:
+Run this alongside `progress-bg` when you want a second loop watching whether selected policies are actually moving through the map:
 
 ```bash
-npm run poke -- movement-monitor-bg --iterations 3600 --poll-ms 1000
+npm run poke -- critic-bg --iterations 3600 --poll-ms 1000
 ```
 
-The movement monitor polls `GET /api/control/status`, reads the active run's `events.jsonl`, extracts `pokemon-post-action-observation.v1` telemetry, and writes:
+The movement critic polls `GET /api/control/status`, reads the active run's `events.jsonl`, extracts `pokemon-post-action-observation.v1` telemetry, and writes:
 
 ```text
 runs/.movement-feedback/<runId>.json

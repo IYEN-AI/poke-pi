@@ -28,7 +28,7 @@ import { startDashboard, type DashboardHandle } from "./dashboardServer.js";
 import { runStrategyLoop } from "./agent/StrategyLoop.js";
 import { readLatestMovementFeedback, runMovementMonitor } from "./agent/MovementMonitor.js";
 
-type HarnessCommand = "snapshot" | "preflight" | "run" | "press" | "smoke" | "dashboard" | "map-heuristic" | "scout" | "synthesize-policy" | "play-policy" | "strategy-loop" | "strategy-bg" | "movement-monitor" | "movement-monitor-bg" | "status" | "play" | "llm" | "ui" | "doctor" | "stop" | "clean-failed";
+type HarnessCommand = "snapshot" | "preflight" | "run" | "press" | "smoke" | "dashboard" | "map-heuristic" | "scout" | "synthesize-policy" | "play-policy" | "progress" | "progress-bg" | "critic" | "critic-bg" | "strategy-loop" | "strategy-bg" | "movement-monitor" | "movement-monitor-bg" | "status" | "play" | "llm" | "ui" | "doctor" | "stop" | "clean-failed";
 
 export interface CliOptions {
   readonly command?: HarnessCommand;
@@ -104,10 +104,10 @@ export function getHarnessHelp(): string {
     "  npm run poke -- synthesize-policy --from-run RUN --policy-id ID [--objective TEXT]",
     "  npm run poke -- play-policy --policy-file policies/generated/ID.json [--max-steps N] [--run-id ID]",
     "  npm run poke -- llm [--max-steps N] [--run-id ID] [--port N] [--policy-file policies/generated/ID.json]",
-    "  npm run poke -- strategy-loop [--iterations N] [--max-steps N] [--llm-every N] [--poll-ms N] [--port N]",
-    "  npm run poke -- strategy-bg [--iterations N] [--max-steps N] [--llm-every N] [--poll-ms N] [--port N]",
-    "  npm run poke -- movement-monitor [--iterations N] [--poll-ms N] [--port N]",
-    "  npm run poke -- movement-monitor-bg [--iterations N] [--poll-ms N] [--port N]",
+    "  npm run poke -- progress [--iterations N] [--max-steps N] [--llm-every N] [--poll-ms N] [--port N]",
+    "  npm run poke -- progress-bg [--iterations N] [--max-steps N] [--llm-every N] [--poll-ms N] [--port N]",
+    "  npm run poke -- critic [--iterations N] [--poll-ms N] [--port N]",
+    "  npm run poke -- critic-bg [--iterations N] [--poll-ms N] [--port N]",
     "  npm run poke -- ui [--port N]",
     "  npm run poke -- stop",
     "  npm run poke -- clean-failed --yes",
@@ -124,10 +124,11 @@ export function getHarnessHelp(): string {
     "  scout      Alias for play: collect cheap heuristic map/state/action evidence.",
     "  synthesize-policy  Create a validated JSON heuristic policy from a scout run.",
     "  play-policy  Execute a generated JSON heuristic policy artifact.",
-    "  strategy-loop  Poll in foreground and alternate scout/generated/LLM-guided policy runs.",
-    "  strategy-bg  Start strategy-loop as a detached background process and write a log under runs/.strategy/.",
-    "  movement-monitor  Watch active runs and write movement feedback under runs/.movement-feedback/.",
-    "  movement-monitor-bg  Start movement-monitor as a detached background observer.",
+    "  progress   Poll in foreground and advance the game through scout/generated/LLM-guided policy phases.",
+    "  progress-bg  Start progress as a detached background process and write a log under runs/.strategy/.",
+    "  critic     Watch active runs and write movement feedback under runs/.movement-feedback/.",
+    "  critic-bg  Start critic as a detached background observer.",
+    "  strategy-loop / strategy-bg / movement-monitor / movement-monitor-bg  Legacy aliases for progress/progress-bg/critic/critic-bg.",
     "  status     Print redacted config and mGBA preflight status.",
     "  play       Start map-aware heuristic Stage 1 with dashboard enabled by default.",
     "  llm        Start OpenAI-compatible Stage 1 with dashboard enabled by default; --policy-file supplies a generated-policy guide.",
@@ -249,7 +250,7 @@ export async function runCli(
 
   if (parsed.errors.length > 0) {
     io.stderr(parsed.errors.join("\n"));
-    io.stderr("\n" + getHarnessHelp());
+    io.stderr(`\n${getHarnessHelp()}`);
     return 1;
   }
 
@@ -272,12 +273,16 @@ export async function runCli(
         return await handleSynthesizePolicy(parsed.options, io, factories);
       case "play-policy":
         return await handlePlayPolicy(parsed.options, io, factories);
+      case "progress":
       case "strategy-loop":
         return await handleStrategyLoop(parsed.options, io, factories);
+      case "progress-bg":
       case "strategy-bg":
         return await handleStrategyBackground(parsed.options, io, factories);
+      case "critic":
       case "movement-monitor":
         return await handleMovementMonitor(parsed.options, io, factories);
+      case "critic-bg":
       case "movement-monitor-bg":
         return await handleMovementMonitorBackground(parsed.options, io, factories);
       case "play":
@@ -296,7 +301,7 @@ export async function runCli(
       case "clean-failed":
         return await handleCleanFailed(parsed.options, io, factories);
       default:
-        io.stderr("Missing command.\n" + getHarnessHelp());
+        io.stderr(`Missing command.\n${getHarnessHelp()}`);
         return 1;
     }
   } catch (error) {
@@ -477,7 +482,7 @@ async function handleStrategyBackground(options: CliOptions, io: CliIo, factorie
   const logHandle = await open(logPath, "a");
   const childArgs = [
     "src/index.ts",
-    "strategy-loop",
+    "progress",
     "--iterations",
     String(options.iterations ?? 12),
     "--max-steps",
@@ -514,12 +519,13 @@ async function handleStrategyBackground(options: CliOptions, io: CliIo, factorie
 async function handleMovementMonitor(options: CliOptions, io: CliIo, factories: CliFactories): Promise<number> {
   const config = loadCommandConfig(options, factories, true);
   const baseUrl = controlBaseUrl(options.dashboardPort);
+  const controlRequest = factories.controlRequest;
   const result = await runMovementMonitor({
     evidenceDir: config.evidenceDir,
     baseUrl,
     iterations: options.iterations ?? 120,
     pollMs: options.pollMs ?? 1000,
-    request: factories.controlRequest === undefined ? undefined : (url, pathName) => factories.controlRequest!(url, pathName, undefined, "GET"),
+    request: controlRequest === undefined ? undefined : (url, pathName) => controlRequest(url, pathName, undefined, "GET"),
     log: (event) => io.stdout(redactSecrets({ command: "movement-monitor", event }))
   });
   io.stdout(redactSecrets({ command: "movement-monitor", dashboardUrl: baseUrl, result }));
@@ -539,7 +545,7 @@ async function handleMovementMonitorBackground(options: CliOptions, io: CliIo, f
   const logHandle = await open(logPath, "a");
   const childArgs = [
     "src/index.ts",
-    "movement-monitor",
+    "critic",
     "--iterations",
     String(options.iterations ?? 3600),
     "--poll-ms",
@@ -977,7 +983,7 @@ function parseNonEmpty(value: string | undefined, name: string, errors: string[]
 }
 
 function isHarnessCommand(value: string): value is HarnessCommand {
-  return value === "snapshot" || value === "preflight" || value === "run" || value === "press" || value === "smoke" || value === "dashboard" || value === "map-heuristic" || value === "scout" || value === "synthesize-policy" || value === "play-policy" || value === "strategy-loop" || value === "strategy-bg" || value === "movement-monitor" || value === "movement-monitor-bg" || value === "status" || value === "play" || value === "llm" || value === "ui" || value === "doctor" || value === "stop" || value === "clean-failed";
+  return value === "snapshot" || value === "preflight" || value === "run" || value === "press" || value === "smoke" || value === "dashboard" || value === "map-heuristic" || value === "scout" || value === "synthesize-policy" || value === "play-policy" || value === "progress" || value === "progress-bg" || value === "critic" || value === "critic-bg" || value === "strategy-loop" || value === "strategy-bg" || value === "movement-monitor" || value === "movement-monitor-bg" || value === "status" || value === "play" || value === "llm" || value === "ui" || value === "doctor" || value === "stop" || value === "clean-failed";
 }
 
 interface MutableCliOptions {

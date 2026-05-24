@@ -16,10 +16,15 @@
     "build": "tsc -p tsconfig.json",
     "dashboard": "tsx src/index.ts dashboard",
     "map:heuristic": "tsx src/index.ts map-heuristic --with-dashboard",
-    "actor-critic": "sh -c 'mkdir -p runs; if lsof -nP -iTCP:51739 -sTCP:LISTEN >/dev/null 2>&1; then tsx src/index.ts strategy-loop \"$@\"; else (cd .local-tools/mgba-http && ./mGBA-http > ../../runs/.mgba-http.log 2>&1) & bridge=$!; sleep 1; tsx src/index.ts strategy-loop \"$@\"; code=$?; kill $bridge 2>/dev/null || true; exit $code; fi' --",
-    "actor-critic:forever": "sh -c 'mkdir -p runs; port=${PORT:-3030}; iterations=${ITERATIONS:-1000000}; max_steps=${MAX_STEPS:-120}; poll_ms=${POLL_MS:-1000}; llm_every=${LLM_EVERY:-4}; run_prefix=${RUN_ID_PREFIX:-continuous}; tsx src/index.ts movement-monitor --iterations \"$iterations\" --poll-ms \"$poll_ms\" --port \"$port\" > runs/.movement-monitor-forever.log 2>&1 & monitor=$!; trap \"kill $monitor 2>/dev/null || true\" INT TERM EXIT; npm run actor-critic -- --iterations \"$iterations\" --max-steps \"$max_steps\" --poll-ms \"$poll_ms\" --llm-every \"$llm_every\" --run-id-prefix \"$run_prefix\" --port \"$port\"'",
-    "actor-critic:bg": "tsx src/index.ts strategy-bg",
-    "actor-critic:monitor": "tsx src/index.ts movement-monitor-bg"
+    "actor-critic": "npm run poke-pi:progress --",
+    "actor-critic:forever": "npm run poke-pi:progress:forever",
+    "actor-critic:bg": "npm run poke-pi:progress:bg --",
+    "actor-critic:monitor": "npm run poke-pi:critic:bg --",
+    "poke-pi:progress": "tsx src/index.ts progress",
+    "poke-pi:progress:bg": "tsx src/index.ts progress-bg",
+    "poke-pi:progress:forever": "sh -c 'mkdir -p runs; port=${PORT:-3030}; iterations=${ITERATIONS:-1000000}; max_steps=${MAX_STEPS:-120}; poll_ms=${POLL_MS:-1000}; llm_every=${LLM_EVERY:-4}; run_prefix=${RUN_ID_PREFIX:-continuous}; npm run poke -- status || { echo \"poke-pi:progress:forever preflight failed; start mGBA, load the ROM, run mGBASocketServer.lua, and verify MGBA_HTTP_BASE_URL\" >&2; exit 1; }; tsx src/index.ts critic --iterations \"$iterations\" --poll-ms \"$poll_ms\" --port \"$port\" > runs/.movement-monitor-forever.log 2>&1 & monitor=$!; trap \"kill $monitor 2>/dev/null || true\" INT TERM EXIT; npm run poke-pi:progress -- --iterations \"$iterations\" --max-steps \"$max_steps\" --poll-ms \"$poll_ms\" --llm-every \"$llm_every\" --run-id-prefix \"$run_prefix\" --port \"$port\"'",
+    "poke-pi:critic": "tsx src/index.ts critic",
+    "poke-pi:critic:bg": "tsx src/index.ts critic-bg"
   },
   "engines": {
     "node": ">=20"
