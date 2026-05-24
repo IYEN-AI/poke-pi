@@ -18,4 +18,5 @@ policies/generated/
 *.sav
 *.state
 *.png
-*.ss1
+*.ss[0-9]
+__pycache__/
