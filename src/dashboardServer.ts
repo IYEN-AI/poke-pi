@@ -79,7 +79,7 @@ async function routeRequest(input: {
 
   try {
     if (url.pathname.startsWith("/api/control")) {
-      await routeControlRequest({ request, response, url, control });
+      await routeControlRequest({ request, response, url, config, control });
       return;
     }
 
@@ -183,12 +183,10 @@ class DashboardControl {
     this.spawnHarness = options.spawnHarness ?? defaultSpawnHarness;
   }
 
-  status(): unknown {
-    return {
-      running: this.child !== undefined,
-      activeRun: this.activeRun,
-      lastRun: this.lastRun
-    };
+  async status(evidenceDir?: string): Promise<unknown> {
+    const run = this.activeRun;
+    const activeEvidence = run === undefined || evidenceDir === undefined ? undefined : await readRun(evidenceDir, run.runId);
+    return buildControlStatus({ running: this.child !== undefined, activeRun: run, lastRun: this.lastRun, activeEvidence });
   }
 
   isRunning(): boolean {
@@ -284,11 +282,12 @@ async function routeControlRequest(input: {
   request: IncomingMessage;
   response: ServerResponse;
   url: URL;
+  config: HarnessConfig;
   control: DashboardControl;
 }): Promise<void> {
-  const { request, response, url, control } = input;
+  const { request, response, url, config, control } = input;
   if (request.method === "GET" && url.pathname === "/api/control/status") {
-    sendJson(response, 200, control.status());
+    sendJson(response, 200, await control.status(config.evidenceDir));
     return;
   }
 
@@ -352,7 +351,7 @@ async function routeAgentRequest(input: {
 
   if (request.method === "GET" && url.pathname === "/api/agent/observation") {
     const live = await readLiveState(client, stateReader);
-    sendJson(response, 200, redactSecrets({ schema: "pokemon-agent-observation.v1", control: control.status(), live }));
+    sendJson(response, 200, redactSecrets({ schema: "pokemon-agent-observation.v1", control: await control.status(config.evidenceDir), live }));
     return;
   }
 
@@ -424,6 +423,29 @@ async function routeAgentRequest(input: {
   }
 
   sendJson(response, 404, { error: "not_found" });
+}
+
+function buildControlStatus(input: { readonly running: boolean; readonly activeRun: unknown; readonly lastRun: unknown; readonly activeEvidence?: unknown }): unknown {
+  const summary = summaryObject(objectField(input.activeEvidence, "summary"));
+  const lastAction = summaryObject(objectField(input.activeEvidence, "lastAction"));
+  const lastDecision = summaryObject(objectField(input.activeEvidence, "lastDecision"));
+  const improvementLog = Array.isArray(objectField(input.activeEvidence, "improvementLog")) ? objectField(input.activeEvidence, "improvementLog") as unknown[] : [];
+  const lastTelemetry = summaryObject(improvementLog.at(-1));
+  const activeRun = input.activeRun === undefined ? undefined : {
+    ...summaryObject(input.activeRun),
+    summaryStatus: stringField(summary, "status"),
+    counts: objectField(summary, "counts"),
+    lastAction: objectField(lastAction, "payload") ?? lastAction,
+    lastDecision: objectField(lastDecision, "payload") ?? lastDecision,
+    latestTelemetry: lastTelemetry.step === undefined && lastTelemetry.frame === undefined ? undefined : lastTelemetry
+  };
+
+  return {
+    schema: "pokemon-control-status.v1",
+    running: input.running,
+    activeRun,
+    lastRun: input.lastRun
+  };
 }
 
 async function readJsonBody(request: IncomingMessage): Promise<unknown> {
@@ -993,14 +1015,22 @@ function runRequestBody(kind) {
 }
 async function refreshControl() {
   const control = await getJson('/api/control/status');
+  const active = control.activeRun;
   renderMetrics('controlSummary', {
     running: control.running ? 'yes' : 'no',
-    active: control.activeRun?.runId ?? 'none',
-    kind: control.activeRun?.kind ?? control.lastRun?.kind ?? 'none',
-    pid: control.activeRun?.pid ?? 'none',
+    active: active?.runId ?? 'none',
+    kind: active?.kind ?? control.lastRun?.kind ?? 'none',
+    pid: active?.pid ?? 'none',
+    status: active?.summaryStatus ?? (control.running ? 'running' : 'idle'),
+    states: active?.counts?.states ?? 'none',
+    actions: active?.counts?.actions ?? 'none',
+    step: active?.latestTelemetry?.step ?? 'none',
     last: control.lastRun?.runId ?? 'none',
     signal: control.lastRun?.signal ?? control.lastRun?.code ?? 'none'
   });
+  if (active?.runId !== undefined && selectedRun !== active.runId) {
+    selectedRun = active.runId;
+  }
   return control;
 }
 async function controlStart(kind) {

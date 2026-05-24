@@ -92,6 +92,52 @@ describe("dashboard server", () => {
     expect(spawned[0]?.env.AI_PROVIDER).toBe("heuristic");
   });
 
+
+  it("reports active run evidence through the same control status used by the dashboard", async () => {
+    const evidenceDir = await mkdtemp(path.join(tmpdir(), "poke-pi-dashboard-control-evidence-"));
+    const runDir = path.join(evidenceDir, "active-one");
+    await mkdir(runDir, { recursive: true });
+    await writeFile(path.join(runDir, "summary.json"), JSON.stringify({ runId: "active-one", status: "running", counts: { states: 2, decisions: 2, actions: 1 } }), "utf8");
+    await writeFile(path.join(runDir, "events.jsonl"), `${[
+      JSON.stringify({ type: "decision", sequence: 1, payload: { decision: { action: { type: "hold", button: "Right", frames: 12 } } } }),
+      JSON.stringify({ type: "action", sequence: 1, payload: { action: { type: "hold", button: "Right", frames: 12 } } }),
+      JSON.stringify({ type: "pokemon_telemetry", payload: { step: 2, frame: 44, location: { mapId: 43, y: 6, x: 4 } } })
+    ].join(`\n`)}\n`, "utf8");
+    const handle = await startDashboard({
+      config: config(evidenceDir),
+      port: 0,
+      spawnHarness() {
+        return Object.assign(new EventEmitter(), { pid: 5678, kill: () => true }) as never;
+      }
+    });
+    handles.push(handle);
+
+    await fetch(`${handle.url}/api/control/play`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ runId: "active-one" })
+    });
+    const statusResponse = await fetch(`${handle.url}/api/control/status`);
+    const htmlResponse = await fetch(`${handle.url}/`);
+
+    expect(await statusResponse.json()).toMatchObject({
+      schema: "pokemon-control-status.v1",
+      running: true,
+      activeRun: {
+        kind: "play",
+        runId: "active-one",
+        pid: 5678,
+        summaryStatus: "running",
+        counts: { states: 2, decisions: 2, actions: 1 },
+        lastAction: { action: { type: "hold", button: "Right", frames: 12 } },
+        latestTelemetry: { step: 2, frame: 44 }
+      }
+    });
+    const html = await htmlResponse.text();
+    expect(html).toContain("latestTelemetry");
+    expect(html).toContain("summaryStatus");
+  });
+
   it("exposes Hermes-style agent endpoints for generated policy orchestration", async () => {
     const evidenceDir = await mkdtemp(path.join(tmpdir(), "poke-pi-dashboard-agent-"));
     const runDir = path.join(evidenceDir, "scout-one");
