@@ -176,6 +176,45 @@ describe("LLMPolicy", () => {
   });
 
 
+  it("performs one Hermes guide-search follow-up and returns the final bounded decision", async () => {
+    const requests: ChatCompletionRequest[] = [];
+    const client = fakeClient(async (request) => {
+      requests.push(request);
+      return requests.length === 1
+        ? JSON.stringify({ guideSearchQuery: "Viridian Mart parcel route" })
+        : JSON.stringify(validDecision);
+    });
+    const policy = createPolicy({ client });
+
+    await expect(policy.chooseAction(policyInput)).resolves.toEqual(validDecision);
+
+    expect(policy.getCallCount()).toBe(2);
+    expect(requests).toHaveLength(2);
+    expect(requests[1]?.messages).toHaveLength((requests[0]?.messages.length ?? 0) + 1);
+    expect(requests[1]?.messages.at(-1)?.content).toContain("Trusted local guide lookup for query: Viridian Mart parcel route");
+    expect(requests[1]?.messages.at(-1)?.content).toContain("Viridian Mart");
+    expect(requests[1]?.messages.at(-1)?.content).toContain("Now output exactly one JSON object");
+  });
+
+  it("falls back if Hermes guide-search would exceed the LLM call budget", async () => {
+    const fallbackErrors: HarnessError[] = [];
+    const policy = createPolicy({
+      maxLlmCalls: 1,
+      client: fakeClient(async () => JSON.stringify({ guideSearchQuery: "Viridian City parcel" })),
+      onFallback: (error) => fallbackErrors.push(error)
+    });
+
+    await expect(policy.chooseAction(policyInput)).resolves.toMatchObject({
+      ...fallbackDecision,
+      rationale: expect.stringContaining("LLM fallback after BUDGET_EXCEEDED"),
+      observedStateCitations: expect.arrayContaining(["LLM fallback after BUDGET_EXCEEDED"])
+    });
+
+    expect(policy.getCallCount()).toBe(1);
+    expect(fallbackErrors.map((error) => error.code)).toEqual(["BUDGET_EXCEEDED"]);
+  });
+
+
   it("omits temperature for GPT-5 compatible models that reject sampling parameters", async () => {
     const requests: ChatCompletionRequest[] = [];
     const client = fakeClient(async (request) => {

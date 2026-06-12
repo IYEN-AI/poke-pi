@@ -13,6 +13,7 @@ import type { AiProvider, HarnessConfig, HarnessMode } from "./config.js";
 import { evaluateAgentRun } from "./evaluation/RunEvaluation.js";
 import { redactSecrets } from "./evidence/EvidenceRecorder.js";
 import { MgbaHttpClient } from "./mgba/MgbaHttpClient.js";
+import { wIsInBattle } from "./pokemon/memoryMap.js";
 import { PokemonStateReader } from "./pokemon/PokemonStateReader.js";
 import { validateWorldKnowledgeUpdate } from "./pokemon/WorldKnowledgeUpdate.js";
 
@@ -23,6 +24,7 @@ export interface DashboardOptions {
   readonly port?: number;
   readonly host?: string;
   readonly spawnHarness?: DashboardSpawnHarness;
+  readonly battleVisualSettleMs?: number;
 }
 
 export interface DashboardHandle {
@@ -32,6 +34,7 @@ export interface DashboardHandle {
 
 const DEFAULT_DASHBOARD_PORT = 3030;
 const MAX_EVENTS = 200;
+const DEFAULT_BATTLE_VISUAL_SETTLE_MS = 1_200;
 
 export async function startDashboard(options: DashboardOptions): Promise<DashboardHandle> {
   const host = options.host ?? "127.0.0.1";
@@ -40,11 +43,12 @@ export async function startDashboard(options: DashboardOptions): Promise<Dashboa
   const stateReader = new PokemonStateReader({ client, version: options.config.pokemonVersion });
   const evidenceDir = path.resolve(options.config.evidenceDir);
   const liveDir = path.join(evidenceDir, ".dashboard-live");
+  const battleVisualSettler = new BattleVisualSettler(options.battleVisualSettleMs ?? DEFAULT_BATTLE_VISUAL_SETTLE_MS);
   await mkdir(liveDir, { recursive: true });
 
   const control = new DashboardControl({ config: { ...options.config, evidenceDir }, spawnHarness: options.spawnHarness });
   const server = createServer((request, response) => {
-    void routeRequest({ request, response, config: { ...options.config, evidenceDir }, client, stateReader, liveDir, control });
+    void routeRequest({ request, response, config: { ...options.config, evidenceDir }, client, stateReader, liveDir, control, battleVisualSettler });
   });
 
   await new Promise<void>((resolve, reject) => {
@@ -73,8 +77,9 @@ async function routeRequest(input: {
   stateReader: PokemonStateReader;
   liveDir: string;
   control: DashboardControl;
+  battleVisualSettler: BattleVisualSettler;
 }): Promise<void> {
-  const { request, response, config, client, stateReader, liveDir, control } = input;
+  const { request, response, config, client, stateReader, liveDir, control, battleVisualSettler } = input;
   const url = new URL(request.url ?? "/", "http://dashboard.local");
 
   try {
@@ -123,7 +128,10 @@ async function routeRequest(input: {
 
     if (url.pathname === "/api/screenshot" || url.pathname === "/api/screen") {
       const screenshotPath = path.join(liveDir, "latest.png");
-      const servedPath = await captureLiveScreenshotOrLatestEvidence(client, screenshotPath, config.evidenceDir, { preferEvidence: control.isRunning() });
+      const servedPath = await captureLiveScreenshotOrLatestEvidence(client, screenshotPath, config.evidenceDir, {
+        preferEvidence: control.isRunning(),
+        battleVisualSettler
+      });
       await sendFile(response, servedPath, "image/png");
       return;
     }
@@ -492,9 +500,13 @@ async function captureLiveScreenshotOrLatestEvidence(
   client: MgbaHttpClient,
   liveScreenshotPath: string,
   evidenceDir: string,
-  options: { readonly preferEvidence?: boolean } = {}
+  options: {
+    readonly preferEvidence?: boolean;
+    readonly battleVisualSettler?: BattleVisualSettler;
+  } = {}
 ): Promise<string> {
-  if (options.preferEvidence === true) {
+  const shouldPreferEvidenceFirst = options.preferEvidence === true && options.battleVisualSettler === undefined;
+  if (shouldPreferEvidenceFirst) {
     const latest = await findLatestEvidenceScreenshot(evidenceDir);
     if (latest !== undefined) {
       return latest;
@@ -502,6 +514,7 @@ async function captureLiveScreenshotOrLatestEvidence(
   }
 
   try {
+    await options.battleVisualSettler?.settleBeforeScreenshot(client);
     return await client.screenshot(liveScreenshotPath);
   } catch (error) {
     const latest = await findLatestEvidenceScreenshot(evidenceDir);
@@ -511,6 +524,41 @@ async function captureLiveScreenshotOrLatestEvidence(
 
     throw error;
   }
+}
+
+class BattleVisualSettler {
+  private wasInBattle = false;
+
+  constructor(private readonly settleMs: number) {}
+
+  async settleBeforeScreenshot(client: MgbaHttpClient): Promise<void> {
+    if (this.settleMs <= 0) {
+      return;
+    }
+
+    const battleFlag = await client.read8(wIsInBattle).catch(() => undefined);
+    if (battleFlag === undefined) {
+      return;
+    }
+
+    const inBattle = battleFlag !== 0;
+
+    if (!inBattle) {
+      this.wasInBattle = false;
+      return;
+    }
+
+    if (this.wasInBattle) {
+      return;
+    }
+
+    this.wasInBattle = true;
+    await sleep(this.settleMs);
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function findLatestEvidenceScreenshot(evidenceDir: string): Promise<string | undefined> {

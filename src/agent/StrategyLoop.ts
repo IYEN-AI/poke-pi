@@ -94,7 +94,9 @@ export async function runStrategyLoop(options: StrategyLoopOptions): Promise<Str
 
 function choosePhase(input: { readonly iteration: number; readonly currentPolicyFile?: string; readonly llmEvery: number; readonly movementFeedback?: unknown }): Phase {
   if (input.currentPolicyFile === undefined) {
-    return "scout";
+    // LLM-autonomous mode: --llm-every 1 means start with direct OpenAI control
+    // instead of forcing a heuristic scout phase first.
+    return input.llmEvery === 1 ? "llm" : "scout";
   }
 
   const quality = movementQuality(input.movementFeedback);

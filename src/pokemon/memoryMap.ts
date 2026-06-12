@@ -22,9 +22,13 @@ export const RED_BLUE_MEMORY_MAP = {
   wXCoord: 0xd362,
   wYBlockCoord: 0xd363,
   wXBlockCoord: 0xd364,
-  wCurMapTileset: 0xd365,
-  wCurMapHeight: 0xd366,
-  wCurMapWidth: 0xd367,
+  // wLastMap and wUnusedLastMapWidth sit between wXBlockCoord and wCurMapHeader.
+  // The actual current-map header starts at wCurMapTileset (0xd367). Using 0xd365
+  // makes Viridian City look like tileset=0x80,height=10,width=0, so map-structure
+  // "decryption"/decoding silently fails.
+  wCurMapTileset: 0xd367,
+  wCurMapHeight: 0xd368,
+  wCurMapWidth: 0xd369,
   wOverworldMap: 0xc580,
   wOverworldMapLength: 1300,
   wLetterPrintingDelayFlags: 0xd358

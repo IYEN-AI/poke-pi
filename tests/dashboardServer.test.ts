@@ -1,5 +1,7 @@
 import { EventEmitter } from "node:events";
 import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -254,6 +256,62 @@ describe("dashboard server", () => {
     expect(html).toContain("Movement monitor feedback");
     expect(html).toContain("Map structure");
     expect(html).toContain("directionCandidates");
+  });
+
+  it("waits out battle-entry HP box animation before serving a live screen", async () => {
+    const evidenceDir = await mkdtemp(path.join(tmpdir(), "poke-pi-dashboard-battle-screen-"));
+    const requests: string[] = [];
+    const onePixelPng = Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGOSHzRgQAAAABJRU5ErkJggg==",
+      "base64"
+    );
+    const mgba = createServer((request, response) => {
+      void (async () => {
+        const url = new URL(request.url ?? "/", "http://mgba.local");
+        requests.push(url.pathname);
+        if (url.pathname === "/core/read8") {
+          response.end("1");
+          return;
+        }
+        if (url.pathname === "/core/screenshot") {
+          const screenshotPath = url.searchParams.get("path");
+          if (screenshotPath !== null) {
+            await writeFile(screenshotPath, onePixelPng);
+          }
+          response.end("ok");
+          return;
+        }
+        response.statusCode = 404;
+        response.end("missing");
+      })();
+    });
+    await new Promise<void>((resolve, reject) => {
+      mgba.once("error", reject);
+      mgba.listen(0, "127.0.0.1", () => {
+        mgba.off("error", reject);
+        resolve();
+      });
+    });
+
+    try {
+      const address = mgba.address() as AddressInfo;
+      const handle = await startDashboard({
+        config: { ...config(evidenceDir), mgbaHttpBaseUrl: `http://127.0.0.1:${address.port}` },
+        port: 0,
+        battleVisualSettleMs: 25
+      });
+      handles.push(handle);
+
+      const startedAt = Date.now();
+      const response = await fetch(`${handle.url}/api/screen`);
+      await response.arrayBuffer();
+
+      expect(response.status).toBe(200);
+      expect(Date.now() - startedAt).toBeGreaterThanOrEqual(20);
+      expect(requests).toEqual(["/core/read8", "/core/screenshot"]);
+    } finally {
+      await new Promise<void>((resolve, reject) => mgba.close((error) => error ? reject(error) : resolve()));
+    }
   });
 
 });

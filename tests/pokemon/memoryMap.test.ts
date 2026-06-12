@@ -59,9 +59,9 @@ describe("Red/Blue memory map", () => {
       wXCoord: 0xd362,
       wYBlockCoord: 0xd363,
       wXBlockCoord: 0xd364,
-      wCurMapTileset: 0xd365,
-      wCurMapHeight: 0xd366,
-      wCurMapWidth: 0xd367,
+      wCurMapTileset: 0xd367,
+      wCurMapHeight: 0xd368,
+      wCurMapWidth: 0xd369,
       wOverworldMap: 0xc580,
       wOverworldMapLength: 1300,
       wLetterPrintingDelayFlags: 0xd358
@@ -92,9 +92,9 @@ describe("Red/Blue memory map", () => {
     expect(wXCoord).toBe(0xd362);
     expect(wYBlockCoord).toBe(0xd363);
     expect(wXBlockCoord).toBe(0xd364);
-    expect(wCurMapTileset).toBe(0xd365);
-    expect(wCurMapHeight).toBe(0xd366);
-    expect(wCurMapWidth).toBe(0xd367);
+    expect(wCurMapTileset).toBe(0xd367);
+    expect(wCurMapHeight).toBe(0xd368);
+    expect(wCurMapWidth).toBe(0xd369);
     expect(wOverworldMap).toBe(0xc580);
     expect(wOverworldMapLength).toBe(1300);
     expect(wLetterPrintingDelayFlags).toBe(0xd358);
